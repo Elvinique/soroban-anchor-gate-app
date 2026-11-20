@@ -45,6 +45,17 @@ pub struct EscrowEntry {
     pub record: EscrowRecord,
 }
 
+/// Proposal for token whitelist modification requiring multi-admin consensus.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WhitelistProposal {
+    pub proposal_id: u64,
+    pub token: Address,
+    pub whitelisted: bool,
+    pub proposer: Address,
+    pub executed: bool,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -55,4 +66,16 @@ pub enum DataKey {
     Escrow(u64),
     TokenWhitelisted(Address),
     WhitelistActive,
+    // Clawback compatibility layer (Issue 51)
+    TokenClawbackFlag(Address),
+    AllowClawbackTokens,
+    // Decentralized keeper incentives (Issue 52)
+    KeeperBountyBps,
+    // Upgradeable contract proxy & migration (Issue 53)
+    ContractVersion,
+    // Multi-token whitelist voting & admin registry (Issue 59)
+    AdminRegistry(Address),
+    AdminCount,
+    WhitelistProposal(u64),
+    ProposalCounter,
 }

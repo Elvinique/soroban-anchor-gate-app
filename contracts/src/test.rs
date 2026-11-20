@@ -1784,3 +1784,605 @@ fn test_gas_benchmark_paginated_query_scaling() {
 
     print_gas_table("get_escrows_paginated payload scaling", &samples);
 }
+
+// =========================================================================
+// Issue 51: Clawback-Aware Token Compatibility Layer Tests
+// =========================================================================
+
+#[test]
+fn test_clawback_flag_management_and_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, admin, treasury, payer, _, _, token_client, _) = setup_test_env(&env, 10_000);
+    client.init(&admin, &treasury, &200);
+
+    // Initial state: clawback tokens allowed, token clawback flag is false
+    assert!(client.is_allow_clawback_tokens());
+    assert!(!client.is_token_clawback_enabled(&token_client.address));
+
+    // Admin sets clawback flag
+    assert!(client
+        .try_set_token_clawback_flag(&admin, &token_client.address, &true)
+        .is_ok());
+    assert!(client.is_token_clawback_enabled(&token_client.address));
+
+    // Non-admin cannot set clawback flag
+    let err = client.try_set_token_clawback_flag(&payer, &token_client.address, &false);
+    assert_eq!(err, Err(Ok(EscrowError::Unauthorized)));
+
+    // Admin toggles allow_clawback_tokens
+    assert!(client.try_set_allow_clawback_tokens(&admin, &false).is_ok());
+    assert!(!client.is_allow_clawback_tokens());
+
+    // Non-admin cannot toggle allow_clawback_tokens
+    let err_allow = client.try_set_allow_clawback_tokens(&payer, &true);
+    assert_eq!(err_allow, Err(Ok(EscrowError::Unauthorized)));
+}
+
+#[test]
+fn test_clawback_disallowed_token_rejected_in_create_escrow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, admin, treasury, payer, beneficiary, _, token_client, _) =
+        setup_test_env(&env, 10_000);
+    client.init(&admin, &treasury, &200);
+
+    // Mark token as having clawback enabled
+    client.set_token_clawback_flag(&admin, &token_client.address, &true);
+
+    // Protocol disallows clawback-enabled tokens
+    client.set_allow_clawback_tokens(&admin, &false);
+
+    let profile_hash = BytesN::from_array(&env, &[11u8; 32]);
+    let res = client.try_create_escrow(
+        &payer,
+        &beneficiary,
+        &token_client.address,
+        &5_000,
+        &profile_hash,
+        &1000,
+    );
+    assert_eq!(res, Err(Ok(EscrowError::ClawbackNotAllowed)));
+
+    // Re-enable clawback tokens allowed
+    client.set_allow_clawback_tokens(&admin, &true);
+    let res_ok = client.try_create_escrow(
+        &payer,
+        &beneficiary,
+        &token_client.address,
+        &5_000,
+        &profile_hash,
+        &1000,
+    );
+    assert!(res_ok.is_ok());
+}
+
+#[test]
+fn test_handle_clawback_adjusts_record_and_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, admin, treasury, payer, beneficiary, _, token_client, _) =
+        setup_test_env(&env, 20_000);
+    client.init(&admin, &treasury, &200);
+
+    let profile_hash = BytesN::from_array(&env, &[12u8; 32]);
+    let escrow_id = client.create_escrow(
+        &payer,
+        &beneficiary,
+        &token_client.address,
+        &10_000,
+        &profile_hash,
+        &1000,
+    );
+
+    // Partial clawback: 3,000 clawed back
+    let res = client.try_handle_clawback(&escrow_id, &3_000);
+    assert!(res.is_ok());
+
+    let record = client.get_escrow(&escrow_id);
+    assert_eq!(record.amount, 7_000);
+    assert_eq!(record.status, EscrowStatus::Funded);
+
+    // Full remaining clawback: 7,000 clawed back
+    let res_full = client.try_handle_clawback(&escrow_id, &7_000);
+    assert!(res_full.is_ok());
+
+    let record_after = client.get_escrow(&escrow_id);
+    assert_eq!(record_after.amount, 0);
+    assert_eq!(record_after.status, EscrowStatus::Refunded);
+
+    // Attempting clawback on terminal status returns InvalidStatus
+    let res_terminal = client.try_handle_clawback(&escrow_id, &1_000);
+    assert_eq!(res_terminal, Err(Ok(EscrowError::InvalidStatus)));
+
+    // Zero amount returns ZeroAmount
+    let res_zero = client.try_handle_clawback(&escrow_id, &0);
+    assert_eq!(res_zero, Err(Ok(EscrowError::ZeroAmount)));
+}
+
+#[test]
+fn test_sync_clawback_with_external_sac_clawback() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, contract_id, admin, treasury, payer, beneficiary, _, token_client, _) =
+        setup_test_env(&env, 20_000);
+    client.init(&admin, &treasury, &200);
+
+    let profile_hash = BytesN::from_array(&env, &[13u8; 32]);
+    let escrow_id = client.create_escrow(
+        &payer,
+        &beneficiary,
+        &token_client.address,
+        &10_000,
+        &profile_hash,
+        &1000,
+    );
+
+    // Simulate external clawback from contract balance:
+    env.as_contract(&contract_id, || {
+        token_client.transfer(&contract_id, &admin, &2_500);
+    });
+    assert_eq!(token_client.balance(&contract_id), 7_500);
+
+    // Contract syncs the clawback discrepancy
+    let deficit = client.sync_clawback(&escrow_id);
+    assert_eq!(deficit, 2_500);
+
+    let record = client.get_escrow(&escrow_id);
+    assert_eq!(record.amount, 7_500);
+
+    // Second sync with no new clawback returns 0
+    let deficit_zero = client.sync_clawback(&escrow_id);
+    assert_eq!(deficit_zero, 0);
+}
+
+#[test]
+fn test_release_to_anchor_graceful_clawback_handling() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, contract_id, admin, treasury, payer, _, anchor_addr, token_client, _) =
+        setup_test_env(&env, 20_000);
+    client.init(&admin, &treasury, &200); // 2% fee
+
+    let profile_hash = BytesN::from_array(&env, &[14u8; 32]);
+    let escrow_id = client.create_escrow(
+        &payer,
+        &Address::generate(&env),
+        &token_client.address,
+        &10_000,
+        &profile_hash,
+        &1000,
+    );
+
+    // Simulate external clawback of 4,000 from contract
+    env.as_contract(&contract_id, || {
+        token_client.transfer(&contract_id, &admin, &4_000);
+    });
+    assert_eq!(token_client.balance(&contract_id), 6_000);
+
+    // release_to_anchor succeeds gracefully!
+    // Distributable balance is 6,000. 2% fee = 120, anchor payout = 5,880.
+    let res = client.try_release_to_anchor(&escrow_id, &payer, &anchor_addr);
+    assert!(res.is_ok());
+
+    assert_eq!(token_client.balance(&treasury), 120);
+    assert_eq!(token_client.balance(&anchor_addr), 5_880);
+    assert_eq!(token_client.balance(&contract_id), 0);
+
+    let record = client.get_escrow(&escrow_id);
+    assert_eq!(record.status, EscrowStatus::Disbursed);
+}
+
+#[test]
+fn test_claim_refund_graceful_clawback_handling() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, contract_id, admin, treasury, payer, _, _, token_client, _) =
+        setup_test_env(&env, 20_000);
+    client.init(&admin, &treasury, &200);
+
+    let profile_hash = BytesN::from_array(&env, &[15u8; 32]);
+    let escrow_id = client.create_escrow(
+        &payer,
+        &Address::generate(&env),
+        &token_client.address,
+        &10_000,
+        &profile_hash,
+        &500,
+    );
+
+    // Simulate external clawback of 3,500
+    env.as_contract(&contract_id, || {
+        token_client.transfer(&contract_id, &admin, &3_500);
+    });
+
+    env.ledger().with_mut(|l| l.timestamp = 2_000);
+
+    let payer_balance_before = token_client.balance(&payer);
+    let res = client.try_claim_refund(&escrow_id, &payer);
+    assert!(res.is_ok());
+
+    // Payer receives remaining 6,500
+    assert_eq!(token_client.balance(&payer), payer_balance_before + 6_500);
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+// =========================================================================
+// Issue 52: Decentralized Keeper Incentives Tests
+// =========================================================================
+
+#[test]
+fn test_keeper_bounty_bps_settings() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, admin, treasury, payer, _, _, _, _) = setup_test_env(&env, 0);
+    client.init(&admin, &treasury, &200);
+
+    // Default keeper bounty is 0 bps
+    assert_eq!(client.get_keeper_bounty_bps(), 0);
+
+    // Admin configures 20 bps (0.20%)
+    assert!(client.try_set_keeper_bounty_bps(&admin, &20).is_ok());
+    assert_eq!(client.get_keeper_bounty_bps(), 20);
+
+    // Non-admin setting bounty is rejected
+    let res_unauth = client.try_set_keeper_bounty_bps(&payer, &25);
+    assert_eq!(res_unauth, Err(Ok(EscrowError::Unauthorized)));
+
+    // Exceeding maximum allowed 1000 bps is rejected
+    let res_excess = client.try_set_keeper_bounty_bps(&admin, &1001);
+    assert_eq!(res_excess, Err(Ok(EscrowError::InvalidBps)));
+}
+
+#[test]
+fn test_keeper_claim_refund_allocates_bounty() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, contract_id, admin, treasury, payer, beneficiary, _, token_client, _) =
+        setup_test_env(&env, 200_000);
+    client.init(&admin, &treasury, &200);
+
+    // 20 bps = 0.20% keeper bounty
+    client.set_keeper_bounty_bps(&admin, &20);
+
+    let profile_hash = BytesN::from_array(&env, &[16u8; 32]);
+    let escrow_id = client.create_escrow(
+        &payer,
+        &beneficiary,
+        &token_client.address,
+        &100_000,
+        &profile_hash,
+        &1_000,
+    );
+
+    let keeper = Address::generate(&env);
+    assert_eq!(token_client.balance(&keeper), 0);
+    let payer_balance_before = token_client.balance(&payer);
+
+    // Advance time past lock duration
+    env.ledger().with_mut(|l| l.timestamp = 2_000);
+
+    // Keeper executes refund liquidation
+    let res = client.try_claim_refund(&escrow_id, &keeper);
+    assert!(res.is_ok());
+
+    // Keeper receives 20 bps of 100,000 = 200
+    assert_eq!(token_client.balance(&keeper), 200);
+    // Payer receives remainder = 99,800
+    assert_eq!(token_client.balance(&payer), payer_balance_before + 99_800);
+    assert_eq!(token_client.balance(&contract_id), 0);
+
+    let record = client.get_escrow(&escrow_id);
+    assert_eq!(record.status, EscrowStatus::Refunded);
+}
+
+#[test]
+fn test_payer_claim_refund_receives_full_amount_no_bounty() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, contract_id, admin, treasury, payer, beneficiary, _, token_client, _) =
+        setup_test_env(&env, 200_000);
+    client.init(&admin, &treasury, &200);
+    client.set_keeper_bounty_bps(&admin, &50); // 50 bps
+
+    let profile_hash = BytesN::from_array(&env, &[17u8; 32]);
+    let escrow_id = client.create_escrow(
+        &payer,
+        &beneficiary,
+        &token_client.address,
+        &100_000,
+        &profile_hash,
+        &1_000,
+    );
+
+    let payer_balance_before = token_client.balance(&payer);
+    env.ledger().with_mut(|l| l.timestamp = 2_000);
+
+    // Payer claims their own refund: receives 100% without bounty deduction
+    let res = client.try_claim_refund(&escrow_id, &payer);
+    assert!(res.is_ok());
+
+    assert_eq!(token_client.balance(&payer), payer_balance_before + 100_000);
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+#[test]
+fn test_keeper_claim_refund_before_unlock_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, admin, treasury, payer, beneficiary, _, token_client, _) =
+        setup_test_env(&env, 100_000);
+    client.init(&admin, &treasury, &200);
+    client.set_keeper_bounty_bps(&admin, &20);
+
+    let profile_hash = BytesN::from_array(&env, &[18u8; 32]);
+    let escrow_id = client.create_escrow(
+        &payer,
+        &beneficiary,
+        &token_client.address,
+        &50_000,
+        &profile_hash,
+        &5_000,
+    );
+
+    let keeper = Address::generate(&env);
+    // Timestamp is 0, unlock timestamp is 5000 -> rejected
+    let res = client.try_claim_refund(&escrow_id, &keeper);
+    assert_eq!(res, Err(Ok(EscrowError::UnlockTimeNotReached)));
+}
+
+// =========================================================================
+// Issue 53: Upgradeable Contract Proxy Pattern & Migration Hooks Tests
+// =========================================================================
+
+#[test]
+fn test_upgrade_requires_admin_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, admin, treasury, payer, _, _, _, _) = setup_test_env(&env, 0);
+    client.init(&admin, &treasury, &200);
+
+    let dummy_hash = BytesN::from_array(&env, &[99u8; 32]);
+
+    // Non-admin attempting to upgrade is rejected
+    let res_unauth = client.try_upgrade(&payer, &dummy_hash);
+    assert_eq!(res_unauth, Err(Ok(EscrowError::Unauthorized)));
+}
+
+#[test]
+fn test_migration_hook_and_versioning() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, admin, treasury, payer, _, _, _, _) = setup_test_env(&env, 0);
+    client.init(&admin, &treasury, &200);
+
+    // Default version is 1
+    assert_eq!(client.get_version(), 1);
+
+    // Non-admin migration rejected
+    let res_unauth = client.try_migrate(&payer, &2);
+    assert_eq!(res_unauth, Err(Ok(EscrowError::Unauthorized)));
+
+    // Migrating to same or lower version rejected
+    let res_downgrade = client.try_migrate(&admin, &1);
+    assert_eq!(res_downgrade, Err(Ok(EscrowError::MigrationFailed)));
+
+    // Admin migrates to version 2
+    let res_ok = client.try_migrate(&admin, &2);
+    assert!(res_ok.is_ok());
+    assert_eq!(client.get_version(), 2);
+
+    // Next migration to version 3
+    assert!(client.try_migrate(&admin, &3).is_ok());
+    assert_eq!(client.get_version(), 3);
+}
+
+#[test]
+fn test_escrow_records_accessible_after_migration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, admin, treasury, payer, beneficiary, anchor_addr, token_client, _) =
+        setup_test_env(&env, 50_000);
+    client.init(&admin, &treasury, &200);
+
+    let profile_hash = BytesN::from_array(&env, &[19u8; 32]);
+    let escrow_id = client.create_escrow(
+        &payer,
+        &beneficiary,
+        &token_client.address,
+        &25_000,
+        &profile_hash,
+        &1_000,
+    );
+
+    // Contract undergoes schema migration
+    client.migrate(&admin, &2);
+    assert_eq!(client.get_version(), 2);
+
+    // Escrow record remains fully accessible
+    let record = client.get_escrow(&escrow_id);
+    assert_eq!(record.amount, 25_000);
+    assert_eq!(record.payer, payer);
+    assert_eq!(record.status, EscrowStatus::Funded);
+
+    // Escrow export includes record intact
+    let page = client.get_escrows_paginated(&1, &10);
+    assert_eq!(page.len(), 1);
+    assert_eq!(page.get(0).unwrap().escrow_id, escrow_id);
+
+    // Execution on existing escrow succeeds after migration
+    let res_release = client.try_release_to_anchor(&escrow_id, &payer, &anchor_addr);
+    assert!(res_release.is_ok());
+
+    let disbursed_record = client.get_escrow(&escrow_id);
+    assert_eq!(disbursed_record.status, EscrowStatus::Disbursed);
+}
+
+// =========================================================================
+// Issue 59: Multi-Token Whitelist Management with Administrative Voting Tests
+// =========================================================================
+
+#[test]
+fn test_multi_admin_management() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, admin1, treasury, payer, _, _, _, _) = setup_test_env(&env, 0);
+    client.init(&admin1, &treasury, &200);
+
+    let admin2 = Address::generate(&env);
+    let admin3 = Address::generate(&env);
+
+    assert_eq!(client.get_admin_count(), 1);
+    assert!(client.is_admin(&admin1));
+    assert!(!client.is_admin(&admin2));
+
+    // Admin 1 adds Admin 2
+    assert!(client.try_add_admin(&admin1, &admin2).is_ok());
+    assert_eq!(client.get_admin_count(), 2);
+    assert!(client.is_admin(&admin2));
+
+    // Adding existing admin returns AdminAlreadyExists
+    let res_dup = client.try_add_admin(&admin1, &admin2);
+    assert_eq!(res_dup, Err(Ok(EscrowError::AdminAlreadyExists)));
+
+    // Non-admin cannot add admin
+    let res_unauth = client.try_add_admin(&payer, &admin3);
+    assert_eq!(res_unauth, Err(Ok(EscrowError::Unauthorized)));
+
+    // Admin 2 adds Admin 3
+    assert!(client.try_add_admin(&admin2, &admin3).is_ok());
+    assert_eq!(client.get_admin_count(), 3);
+
+    // Admin 1 removes Admin 3
+    assert!(client.try_remove_admin(&admin1, &admin3).is_ok());
+    assert_eq!(client.get_admin_count(), 2);
+    assert!(!client.is_admin(&admin3));
+
+    // Removing non-existent admin returns AdminNotFound
+    let res_not_found = client.try_remove_admin(&admin1, &admin3);
+    assert_eq!(res_not_found, Err(Ok(EscrowError::AdminNotFound)));
+
+    // Admin 1 removes Admin 2
+    assert!(client.try_remove_admin(&admin1, &admin2).is_ok());
+    assert_eq!(client.get_admin_count(), 1);
+
+    // Cannot remove the last remaining admin
+    let res_last = client.try_remove_admin(&admin1, &admin1);
+    assert_eq!(res_last, Err(Ok(EscrowError::CannotRemoveLastAdmin)));
+}
+
+#[test]
+fn test_two_step_whitelist_voting_flow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, admin1, treasury, payer, _, _, _, _) = setup_test_env(&env, 0);
+    client.init(&admin1, &treasury, &200);
+
+    let admin2 = Address::generate(&env);
+    client.add_admin(&admin1, &admin2);
+
+    let token_admin = Address::generate(&env);
+    let new_token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    // Enable whitelist active by whitelisting primary token first
+    client.set_token_whitelist(&admin1, &Address::generate(&env), &true);
+    assert!(!client.is_token_whitelisted(&new_token));
+
+    // Non-admin proposal rejected
+    let res_unauth_prop = client.try_propose_token_whitelist(&payer, &new_token, &true);
+    assert_eq!(res_unauth_prop, Err(Ok(EscrowError::Unauthorized)));
+
+    // Admin 1 proposes whitelisting new token
+    let prop_id = client.propose_token_whitelist(&admin1, &new_token, &true);
+    assert_eq!(prop_id, 1);
+
+    let proposal = client.get_proposal(&prop_id);
+    assert_eq!(proposal.token, new_token);
+    assert!(proposal.whitelisted);
+    assert_eq!(proposal.proposer, admin1);
+    assert!(!proposal.executed);
+
+    // Token is NOT whitelisted yet
+    assert!(!client.is_token_whitelisted(&new_token));
+
+    // Non-admin confirmation rejected
+    let res_unauth_conf = client.try_confirm_token_whitelist(&payer, &prop_id);
+    assert_eq!(res_unauth_conf, Err(Ok(EscrowError::Unauthorized)));
+
+    // Admin 1 confirming own proposal rejected (requires 2 distinct admin signatures!)
+    let res_self_conf = client.try_confirm_token_whitelist(&admin1, &prop_id);
+    assert_eq!(
+        res_self_conf,
+        Err(Ok(EscrowError::CannotConfirmOwnProposal))
+    );
+
+    // Admin 2 confirms proposal
+    let res_ok = client.try_confirm_token_whitelist(&admin2, &prop_id);
+    assert!(res_ok.is_ok());
+
+    // Token is now whitelisted!
+    assert!(client.is_token_whitelisted(&new_token));
+
+    // Confirming already executed proposal rejected
+    let res_dup_conf = client.try_confirm_token_whitelist(&admin2, &prop_id);
+    assert_eq!(res_dup_conf, Err(Ok(EscrowError::ProposalAlreadyExecuted)));
+
+    // Invalid proposal ID returns ProposalNotFound
+    let res_missing = client.try_confirm_token_whitelist(&admin2, &999);
+    assert_eq!(res_missing, Err(Ok(EscrowError::ProposalNotFound)));
+}
+
+#[test]
+fn test_delisting_token_does_not_brick_existing_open_escrows() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, admin1, treasury, payer, beneficiary, anchor_addr, token_client, _) =
+        setup_test_env(&env, 50_000);
+    client.init(&admin1, &treasury, &200);
+
+    let admin2 = Address::generate(&env);
+    client.add_admin(&admin1, &admin2);
+
+    // Whitelist token via voting
+    let prop_whitelist = client.propose_token_whitelist(&admin1, &token_client.address, &true);
+    client.confirm_token_whitelist(&admin2, &prop_whitelist);
+    assert!(client.is_token_whitelisted(&token_client.address));
+
+    // Create an open escrow with the whitelisted token
+    let profile_hash = BytesN::from_array(&env, &[20u8; 32]);
+    let escrow_id = client.create_escrow(
+        &payer,
+        &beneficiary,
+        &token_client.address,
+        &20_000,
+        &profile_hash,
+        &1_000,
+    );
+
+    // Admin 1 and Admin 2 vote to DELIST the token
+    let prop_delist = client.propose_token_whitelist(&admin1, &token_client.address, &false);
+    client.confirm_token_whitelist(&admin2, &prop_delist);
+    assert!(!client.is_token_whitelisted(&token_client.address));
+
+    // New escrows with the delisted token are rejected
+    let res_new_escrow = client.try_create_escrow(
+        &payer,
+        &beneficiary,
+        &token_client.address,
+        &10_000,
+        &profile_hash,
+        &1_000,
+    );
+    assert_eq!(res_new_escrow, Err(Ok(EscrowError::TokenNotWhitelisted)));
+
+    // Existing open escrow is NOT bricked: release_to_anchor succeeds completely!
+    let res_release = client.try_release_to_anchor(&escrow_id, &payer, &anchor_addr);
+    assert!(res_release.is_ok());
+
+    let record = client.get_escrow(&escrow_id);
+    assert_eq!(record.status, EscrowStatus::Disbursed);
+    assert_eq!(token_client.balance(&anchor_addr), 19_600);
+    assert_eq!(token_client.balance(&treasury), 400);
+}

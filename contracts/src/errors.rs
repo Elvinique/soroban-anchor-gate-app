@@ -20,4 +20,13 @@ pub enum EscrowError {
     TooManyDisbursements = 14,
     InvalidDisbursementAmount = 15,
     DisbursementMismatch = 16,
+    // Wave enhancements: Issues 51, 52, 53, 59
+    ClawbackNotAllowed = 17,
+    ProposalNotFound = 18,
+    ProposalAlreadyExecuted = 19,
+    CannotConfirmOwnProposal = 20,
+    AdminAlreadyExists = 21,
+    CannotRemoveLastAdmin = 22,
+    AdminNotFound = 23,
+    MigrationFailed = 24,
 }

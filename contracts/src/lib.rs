@@ -7,7 +7,9 @@ mod types;
 mod test;
 
 use crate::errors::EscrowError;
-use crate::types::{DataKey, DisbursementCommitment, EscrowEntry, EscrowRecord, EscrowStatus};
+use crate::types::{
+    DataKey, DisbursementCommitment, EscrowEntry, EscrowRecord, EscrowStatus, WhitelistProposal,
+};
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, BytesN, Env, Symbol, Vec};
 
 const BPS_DIVISOR: i128 = 10_000;
@@ -28,6 +30,25 @@ pub const MAX_PAGE_SIZE: u32 = 50;
 #[contract]
 pub struct EscrowGate;
 
+impl EscrowGate {
+    fn check_is_admin(env: &Env, account: &Address) -> bool {
+        if let Some(primary_admin) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+        {
+            if *account == primary_admin {
+                return true;
+            }
+        }
+
+        env.storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::AdminRegistry(account.clone()))
+            .unwrap_or(false)
+    }
+}
+
 #[contractimpl]
 impl EscrowGate {
     pub fn init(
@@ -46,9 +67,25 @@ impl EscrowGate {
         admin.require_auth();
 
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminRegistry(admin.clone()), &true);
+        env.storage().instance().set(&DataKey::AdminCount, &1u32);
         env.storage().instance().set(&DataKey::Treasury, &treasury);
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         env.storage().instance().set(&DataKey::EscrowCounter, &0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &1u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowClawbackTokens, &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::KeeperBountyBps, &0u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposalCounter, &0u64);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_EXTEND_TTL_THRESHOLD, INSTANCE_EXTEND_TTL_AMOUNT);
@@ -65,6 +102,10 @@ impl EscrowGate {
         profile_hash: BytesN<32>,
         lock_duration: u64,
     ) -> Result<u64, EscrowError> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(EscrowError::NotInitialized);
+        }
+
         payer.require_auth();
 
         if amount <= 0 {
@@ -73,6 +114,12 @@ impl EscrowGate {
 
         if !Self::is_token_whitelisted(env.clone(), token.clone()) {
             return Err(EscrowError::TokenNotWhitelisted);
+        }
+
+        if !Self::is_allow_clawback_tokens(env.clone())
+            && Self::is_token_clawback_enabled(env.clone(), token.clone())
+        {
+            return Err(EscrowError::ClawbackNotAllowed);
         }
 
         let mut counter: u64 = env
@@ -132,13 +179,11 @@ impl EscrowGate {
         caller: Address,
         anchor_disbursement_address: Address,
     ) -> Result<(), EscrowError> {
-        caller.require_auth();
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(EscrowError::NotInitialized);
+        }
 
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(EscrowError::NotInitialized)?;
+        caller.require_auth();
 
         let key = DataKey::Escrow(escrow_id);
         let mut record: EscrowRecord = env
@@ -147,12 +192,24 @@ impl EscrowGate {
             .get(&key)
             .ok_or(EscrowError::EscrowNotFound)?;
 
-        if caller != record.payer && caller != admin {
+        if caller != record.payer && !Self::check_is_admin(&env, &caller) {
             return Err(EscrowError::Unauthorized);
         }
 
         if record.status != EscrowStatus::Funded {
             return Err(EscrowError::InvalidStatus);
+        }
+
+        let token_client = token::Client::new(&env, &record.token);
+        let contract_balance = token_client.balance(&env.current_contract_address());
+        let mut distributable_amount = record.amount;
+        if contract_balance < record.amount {
+            let deficit = record.amount - contract_balance;
+            distributable_amount = contract_balance;
+            env.events().publish(
+                (Symbol::new(&env, "ClawbackHandled"), record.token.clone()),
+                (escrow_id, deficit),
+            );
         }
 
         let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
@@ -162,27 +219,25 @@ impl EscrowGate {
             .get(&DataKey::Treasury)
             .ok_or(EscrowError::NotInitialized)?;
 
-        let fee_amount = record
-            .amount
+        let fee_amount = distributable_amount
             .checked_mul(fee_bps as i128)
             .ok_or(EscrowError::ArithmeticOverflow)?
             / BPS_DIVISOR;
-        let payout_amount = record
-            .amount
+        let payout_amount = distributable_amount
             .checked_sub(fee_amount)
             .ok_or(EscrowError::ArithmeticOverflow)?;
-
-        let token_client = token::Client::new(&env, &record.token);
 
         if fee_amount > 0 {
             token_client.transfer(&env.current_contract_address(), &treasury, &fee_amount);
         }
 
-        token_client.transfer(
-            &env.current_contract_address(),
-            &anchor_disbursement_address,
-            &payout_amount,
-        );
+        if payout_amount > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &anchor_disbursement_address,
+                &payout_amount,
+            );
+        }
 
         record.status = EscrowStatus::Disbursed;
         env.storage().persistent().set(&key, &record);
@@ -199,31 +254,17 @@ impl EscrowGate {
     }
 
     /// Disburses a funded escrow across multiple bank-account commitments.
-    ///
-    /// The protocol treasury fee (`fee_bps`) is deducted first, exactly as in
-    /// `release_to_anchor`. The remaining distributable balance must then be
-    /// covered *exactly* by the supplied commitments: the sum of all
-    /// `commitment.amount` values must equal `escrow.amount - fee`. Any
-    /// mismatch (under- or over-allocation) is rejected so funds can never be
-    /// stranded in, or over-drawn from, the contract.
-    ///
-    /// Emits one `split_disb` event per leg, keyed by `(escrow_id, leg_index)`
-    /// with payload `(recipient, amount, commitment_hash)`, followed by a
-    /// summary `disbursed` event carrying `(profile_hash, total_payout)` so
-    /// existing indexers that only track `disbursed` keep working.
     pub fn release_split(
         env: Env,
         escrow_id: u64,
         caller: Address,
         commitments: Vec<DisbursementCommitment>,
     ) -> Result<(), EscrowError> {
-        caller.require_auth();
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(EscrowError::NotInitialized);
+        }
 
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(EscrowError::NotInitialized)?;
+        caller.require_auth();
 
         let key = DataKey::Escrow(escrow_id);
         let mut record: EscrowRecord = env
@@ -232,7 +273,7 @@ impl EscrowGate {
             .get(&key)
             .ok_or(EscrowError::EscrowNotFound)?;
 
-        if caller != record.payer && caller != admin {
+        if caller != record.payer && !Self::check_is_admin(&env, &caller) {
             return Err(EscrowError::Unauthorized);
         }
 
@@ -248,6 +289,19 @@ impl EscrowGate {
             return Err(EscrowError::TooManyDisbursements);
         }
 
+        let token_client = token::Client::new(&env, &record.token);
+        let contract_address = env.current_contract_address();
+        let contract_balance = token_client.balance(&contract_address);
+        let mut distributable_base = record.amount;
+        if contract_balance < record.amount {
+            let deficit = record.amount - contract_balance;
+            distributable_base = contract_balance;
+            env.events().publish(
+                (Symbol::new(&env, "ClawbackHandled"), record.token.clone()),
+                (escrow_id, deficit),
+            );
+        }
+
         let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
         let treasury: Address = env
             .storage()
@@ -255,13 +309,11 @@ impl EscrowGate {
             .get(&DataKey::Treasury)
             .ok_or(EscrowError::NotInitialized)?;
 
-        let fee_amount = record
-            .amount
+        let fee_amount = distributable_base
             .checked_mul(fee_bps as i128)
             .ok_or(EscrowError::ArithmeticOverflow)?
             / BPS_DIVISOR;
-        let distributable = record
-            .amount
+        let distributable = distributable_base
             .checked_sub(fee_amount)
             .ok_or(EscrowError::ArithmeticOverflow)?;
 
@@ -291,9 +343,6 @@ impl EscrowGate {
             .instance()
             .extend_ttl(INSTANCE_EXTEND_TTL_THRESHOLD, INSTANCE_EXTEND_TTL_AMOUNT);
 
-        let token_client = token::Client::new(&env, &record.token);
-        let contract_address = env.current_contract_address();
-
         if fee_amount > 0 {
             token_client.transfer(&contract_address, &treasury, &fee_amount);
         }
@@ -319,15 +368,20 @@ impl EscrowGate {
         Ok(())
     }
 
-    pub fn refund(env: Env, escrow_id: u64) -> Result<(), EscrowError> {
+    /// Decentralized refund claiming mechanism with keeper incentive support.
+    /// If caller != payer, allocates keeper bounty (bps) to the caller and remainder to payer.
+    /// If caller == payer, returns the entire refundable amount to payer.
+    pub fn claim_refund(env: Env, escrow_id: u64, caller: Address) -> Result<(), EscrowError> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(EscrowError::NotInitialized);
+        }
+
         let key = DataKey::Escrow(escrow_id);
         let mut record: EscrowRecord = env
             .storage()
             .persistent()
             .get(&key)
             .ok_or(EscrowError::EscrowNotFound)?;
-
-        record.payer.require_auth();
 
         if record.status != EscrowStatus::Funded {
             return Err(EscrowError::InvalidStatus);
@@ -337,12 +391,52 @@ impl EscrowGate {
             return Err(EscrowError::UnlockTimeNotReached);
         }
 
+        caller.require_auth();
+
         let token_client = token::Client::new(&env, &record.token);
-        token_client.transfer(
-            &env.current_contract_address(),
-            &record.payer,
-            &record.amount,
-        );
+        let contract_balance = token_client.balance(&env.current_contract_address());
+        let mut available_amount = record.amount;
+        if contract_balance < record.amount {
+            let deficit = record.amount - contract_balance;
+            available_amount = contract_balance;
+            env.events().publish(
+                (Symbol::new(&env, "ClawbackHandled"), record.token.clone()),
+                (escrow_id, deficit),
+            );
+        }
+
+        if caller != record.payer {
+            let bounty_bps = Self::get_keeper_bounty_bps(env.clone());
+            let bounty = available_amount
+                .checked_mul(bounty_bps as i128)
+                .ok_or(EscrowError::ArithmeticOverflow)?
+                / BPS_DIVISOR;
+            let refund_amount = available_amount
+                .checked_sub(bounty)
+                .ok_or(EscrowError::ArithmeticOverflow)?;
+
+            if bounty > 0 {
+                token_client.transfer(&env.current_contract_address(), &caller, &bounty);
+            }
+            if refund_amount > 0 {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &record.payer,
+                    &refund_amount,
+                );
+            }
+
+            env.events().publish(
+                (Symbol::new(&env, "keeper_refund"), escrow_id),
+                (caller, bounty, record.payer.clone(), refund_amount),
+            );
+        } else if available_amount > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &record.payer,
+                &available_amount,
+            );
+        }
 
         record.status = EscrowStatus::Refunded;
         env.storage().persistent().set(&key, &record);
@@ -351,26 +445,41 @@ impl EscrowGate {
             .extend_ttl(INSTANCE_EXTEND_TTL_THRESHOLD, INSTANCE_EXTEND_TTL_AMOUNT);
 
         env.events()
-            .publish((Symbol::new(&env, "refunded"), escrow_id), record.amount);
+            .publish((Symbol::new(&env, "refunded"), escrow_id), available_amount);
 
         Ok(())
     }
 
+    /// Payer-initiated refund backward compatibility endpoint.
+    pub fn refund(env: Env, escrow_id: u64) -> Result<(), EscrowError> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(EscrowError::NotInitialized);
+        }
+
+        let key = DataKey::Escrow(escrow_id);
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::EscrowNotFound)?;
+
+        Self::claim_refund(env, escrow_id, record.payer)
+    }
+
+    /// Single admin or direct token whitelist setter.
     pub fn set_token_whitelist(
         env: Env,
         caller: Address,
         token: Address,
         whitelisted: bool,
     ) -> Result<(), EscrowError> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(EscrowError::NotInitialized);
+        }
+
         caller.require_auth();
 
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(EscrowError::NotInitialized)?;
-
-        if caller != admin {
+        if !Self::check_is_admin(&env, &caller) {
             return Err(EscrowError::Unauthorized);
         }
 
@@ -407,6 +516,496 @@ impl EscrowGate {
             .unwrap_or(false)
     }
 
+    // --- Clawback Compatibility Layer (Issue 51) ---
+
+    pub fn set_token_clawback_flag(
+        env: Env,
+        caller: Address,
+        token: Address,
+        clawback_enabled: bool,
+    ) -> Result<(), EscrowError> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(EscrowError::NotInitialized);
+        }
+
+        caller.require_auth();
+        if !Self::check_is_admin(&env, &caller) {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        env.storage().instance().set(
+            &DataKey::TokenClawbackFlag(token.clone()),
+            &clawback_enabled,
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_EXTEND_TTL_THRESHOLD, INSTANCE_EXTEND_TTL_AMOUNT);
+
+        env.events().publish(
+            (Symbol::new(&env, "clawback_flag_set"), token),
+            clawback_enabled,
+        );
+
+        Ok(())
+    }
+
+    pub fn is_token_clawback_enabled(env: Env, token: Address) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::TokenClawbackFlag(token))
+            .unwrap_or(false)
+    }
+
+    pub fn set_allow_clawback_tokens(
+        env: Env,
+        caller: Address,
+        allowed: bool,
+    ) -> Result<(), EscrowError> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(EscrowError::NotInitialized);
+        }
+
+        caller.require_auth();
+        if !Self::check_is_admin(&env, &caller) {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowClawbackTokens, &allowed);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_EXTEND_TTL_THRESHOLD, INSTANCE_EXTEND_TTL_AMOUNT);
+
+        env.events()
+            .publish((Symbol::new(&env, "allow_clawback_set"), caller), allowed);
+
+        Ok(())
+    }
+
+    pub fn is_allow_clawback_tokens(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::AllowClawbackTokens)
+            .unwrap_or(true)
+    }
+
+    /// Handles an external clawback deduction on an escrow record to keep internal balance aligned.
+    pub fn handle_clawback(env: Env, escrow_id: u64, amount: i128) -> Result<(), EscrowError> {
+        if amount <= 0 {
+            return Err(EscrowError::ZeroAmount);
+        }
+
+        let key = DataKey::Escrow(escrow_id);
+        let mut record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::EscrowNotFound)?;
+
+        if record.status != EscrowStatus::Funded {
+            return Err(EscrowError::InvalidStatus);
+        }
+
+        let handled_amount = if amount >= record.amount {
+            let fully_clawed = record.amount;
+            record.amount = 0;
+            record.status = EscrowStatus::Refunded;
+            fully_clawed
+        } else {
+            record.amount = record
+                .amount
+                .checked_sub(amount)
+                .ok_or(EscrowError::ArithmeticOverflow)?;
+            amount
+        };
+
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_EXTEND_TTL_THRESHOLD,
+            PERSISTENT_EXTEND_TTL_AMOUNT,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "ClawbackHandled"), record.token),
+            (escrow_id, handled_amount),
+        );
+
+        Ok(())
+    }
+
+    /// Audits on-chain contract token balance against escrow state and handles any discrepancy.
+    pub fn sync_clawback(env: Env, escrow_id: u64) -> Result<i128, EscrowError> {
+        let key = DataKey::Escrow(escrow_id);
+        let mut record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::EscrowNotFound)?;
+
+        if record.status != EscrowStatus::Funded {
+            return Err(EscrowError::InvalidStatus);
+        }
+
+        let token_client = token::Client::new(&env, &record.token);
+        let balance = token_client.balance(&env.current_contract_address());
+
+        if balance < record.amount {
+            let deficit = record.amount - balance;
+            record.amount = balance;
+            if balance == 0 {
+                record.status = EscrowStatus::Refunded;
+            }
+            env.storage().persistent().set(&key, &record);
+            env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_EXTEND_TTL_THRESHOLD,
+                PERSISTENT_EXTEND_TTL_AMOUNT,
+            );
+
+            env.events().publish(
+                (Symbol::new(&env, "ClawbackHandled"), record.token),
+                (escrow_id, deficit),
+            );
+
+            Ok(deficit)
+        } else {
+            Ok(0)
+        }
+    }
+
+    // --- Keeper Bounty Settings (Issue 52) ---
+
+    pub fn set_keeper_bounty_bps(
+        env: Env,
+        caller: Address,
+        bounty_bps: u32,
+    ) -> Result<(), EscrowError> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(EscrowError::NotInitialized);
+        }
+
+        caller.require_auth();
+        if !Self::check_is_admin(&env, &caller) {
+            return Err(EscrowError::Unauthorized);
+        }
+        if bounty_bps > 1000 {
+            return Err(EscrowError::InvalidBps);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::KeeperBountyBps, &bounty_bps);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_EXTEND_TTL_THRESHOLD, INSTANCE_EXTEND_TTL_AMOUNT);
+
+        env.events()
+            .publish((Symbol::new(&env, "bounty_bps_set"), caller), bounty_bps);
+
+        Ok(())
+    }
+
+    pub fn get_keeper_bounty_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::KeeperBountyBps)
+            .unwrap_or(0)
+    }
+
+    // --- Multi-Admin Registry & Two-Step Whitelist Voting (Issue 59) ---
+
+    pub fn is_admin(env: Env, account: Address) -> bool {
+        Self::check_is_admin(&env, &account)
+    }
+
+    pub fn add_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), EscrowError> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(EscrowError::NotInitialized);
+        }
+
+        caller.require_auth();
+        if !Self::check_is_admin(&env, &caller) {
+            return Err(EscrowError::Unauthorized);
+        }
+        if Self::check_is_admin(&env, &new_admin) {
+            return Err(EscrowError::AdminAlreadyExists);
+        }
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminCount)
+            .unwrap_or(1);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminRegistry(new_admin.clone()), &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminCount, &(count + 1));
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_EXTEND_TTL_THRESHOLD, INSTANCE_EXTEND_TTL_AMOUNT);
+
+        env.events()
+            .publish((Symbol::new(&env, "admin_added"), new_admin), caller);
+
+        Ok(())
+    }
+
+    pub fn remove_admin(
+        env: Env,
+        caller: Address,
+        admin_to_remove: Address,
+    ) -> Result<(), EscrowError> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(EscrowError::NotInitialized);
+        }
+
+        caller.require_auth();
+        if !Self::check_is_admin(&env, &caller) {
+            return Err(EscrowError::Unauthorized);
+        }
+        if !Self::check_is_admin(&env, &admin_to_remove) {
+            return Err(EscrowError::AdminNotFound);
+        }
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminCount)
+            .unwrap_or(1);
+
+        if count <= 1 {
+            return Err(EscrowError::CannotRemoveLastAdmin);
+        }
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::AdminRegistry(admin_to_remove.clone()));
+
+        if let Some(primary_admin) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+        {
+            if primary_admin == admin_to_remove {
+                // If primary admin removed, point to caller
+                env.storage().instance().set(&DataKey::Admin, &caller);
+            }
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminCount, &(count - 1));
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_EXTEND_TTL_THRESHOLD, INSTANCE_EXTEND_TTL_AMOUNT);
+
+        env.events().publish(
+            (Symbol::new(&env, "admin_removed"), admin_to_remove),
+            caller,
+        );
+
+        Ok(())
+    }
+
+    pub fn get_admin_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::AdminCount)
+            .unwrap_or(1)
+    }
+
+    /// Step 1: Propose adding or removing a token from the whitelist.
+    pub fn propose_token_whitelist(
+        env: Env,
+        caller: Address,
+        token: Address,
+        whitelisted: bool,
+    ) -> Result<u64, EscrowError> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(EscrowError::NotInitialized);
+        }
+
+        caller.require_auth();
+        if !Self::check_is_admin(&env, &caller) {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        let mut counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalCounter)
+            .unwrap_or(0);
+
+        counter = counter
+            .checked_add(1)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+
+        let proposal = WhitelistProposal {
+            proposal_id: counter,
+            token: token.clone(),
+            whitelisted,
+            proposer: caller.clone(),
+            executed: false,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::WhitelistProposal(counter), &proposal);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposalCounter, &counter);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_EXTEND_TTL_THRESHOLD, INSTANCE_EXTEND_TTL_AMOUNT);
+
+        env.events().publish(
+            (Symbol::new(&env, "whitelist_proposed"), counter),
+            (token, whitelisted, caller),
+        );
+
+        Ok(counter)
+    }
+
+    /// Step 2: Confirm a whitelist proposal. Must be confirmed by a distinct admin.
+    pub fn confirm_token_whitelist(
+        env: Env,
+        caller: Address,
+        proposal_id: u64,
+    ) -> Result<(), EscrowError> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(EscrowError::NotInitialized);
+        }
+
+        caller.require_auth();
+        if !Self::check_is_admin(&env, &caller) {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        let mut proposal: WhitelistProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::WhitelistProposal(proposal_id))
+            .ok_or(EscrowError::ProposalNotFound)?;
+
+        if proposal.executed {
+            return Err(EscrowError::ProposalAlreadyExecuted);
+        }
+
+        if caller == proposal.proposer {
+            return Err(EscrowError::CannotConfirmOwnProposal);
+        }
+
+        proposal.executed = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::WhitelistProposal(proposal_id), &proposal);
+
+        env.storage().instance().set(
+            &DataKey::TokenWhitelisted(proposal.token.clone()),
+            &proposal.whitelisted,
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::WhitelistActive, &true);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_EXTEND_TTL_THRESHOLD, INSTANCE_EXTEND_TTL_AMOUNT);
+
+        env.events().publish(
+            (Symbol::new(&env, "whitelist"), proposal.token.clone()),
+            proposal.whitelisted,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "whitelist_confirmed"), proposal_id),
+            (proposal.token, proposal.whitelisted),
+        );
+
+        Ok(())
+    }
+
+    pub fn get_proposal(env: Env, proposal_id: u64) -> Result<WhitelistProposal, EscrowError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::WhitelistProposal(proposal_id))
+            .ok_or(EscrowError::ProposalNotFound)
+    }
+
+    // --- Contract Upgrade & Migration Hooks (Issue 53) ---
+
+    /// Upgrades the contract WASM bytecode with strict administrator authorization.
+    pub fn upgrade(
+        env: Env,
+        caller: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), EscrowError> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(EscrowError::NotInitialized);
+        }
+
+        caller.require_auth();
+        if !Self::check_is_admin(&env, &caller) {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+
+        env.events().publish(
+            (Symbol::new(&env, "contract_upgraded"), new_wasm_hash),
+            caller,
+        );
+
+        Ok(())
+    }
+
+    /// Post-upgrade storage schema migration hook.
+    pub fn migrate(env: Env, caller: Address, target_version: u32) -> Result<(), EscrowError> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(EscrowError::NotInitialized);
+        }
+
+        caller.require_auth();
+        if !Self::check_is_admin(&env, &caller) {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        let current_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContractVersion)
+            .unwrap_or(1);
+
+        if target_version <= current_version {
+            return Err(EscrowError::MigrationFailed);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &target_version);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_EXTEND_TTL_THRESHOLD, INSTANCE_EXTEND_TTL_AMOUNT);
+
+        env.events().publish(
+            (Symbol::new(&env, "state_migrated"), target_version),
+            caller,
+        );
+
+        Ok(())
+    }
+
+    pub fn get_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ContractVersion)
+            .unwrap_or(1)
+    }
+
     pub fn resolve_dispute(
         env: Env,
         escrow_id: u64,
@@ -414,15 +1013,13 @@ impl EscrowGate {
         payer_bps: u32,
         beneficiary_bps: u32,
     ) -> Result<(), EscrowError> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(EscrowError::NotInitialized);
+        }
+
         caller.require_auth();
 
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(EscrowError::NotInitialized)?;
-
-        if caller != admin {
+        if !Self::check_is_admin(&env, &caller) {
             return Err(EscrowError::Unauthorized);
         }
 
@@ -493,13 +1090,6 @@ impl EscrowGate {
     }
 
     /// Paginated, read-only audit export of escrow records.
-    ///
-    /// Returns up to `limit` consecutive escrows starting at `start_id`
-    /// (inclusive). Escrow IDs are 1-based, so `start_id = 0` is treated as
-    /// `1`. `limit` is clamped to [`MAX_PAGE_SIZE`] to bound the read cost of a
-    /// single call; `limit = 0` or a `start_id` beyond the current counter
-    /// yields an empty page. Callers advance by passing
-    /// `last_entry.escrow_id + 1` as the next `start_id`.
     pub fn get_escrows_paginated(env: Env, start_id: u64, limit: u32) -> Vec<EscrowEntry> {
         let mut page: Vec<EscrowEntry> = Vec::new(&env);
 
@@ -515,8 +1105,6 @@ impl EscrowGate {
             return page;
         }
 
-        // `first <= counter` and `effective_limit >= 1`, so `first - 1 + limit`
-        // only saturates when the counter itself is near u64::MAX.
         let last = (first - 1).saturating_add(effective_limit).min(counter);
 
         for escrow_id in first..=last {

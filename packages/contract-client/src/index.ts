@@ -21,6 +21,8 @@ import {
   xdr,
 } from "@stellar/stellar-sdk";
 import { createHash } from "crypto";
+import { createEscrowEventIterator } from "./events";
+import type { EscrowEvent, WatchEscrowOptions } from "./events";
 
 /**
  * Connection and network settings required by {@link EscrowGateClient}.
@@ -327,6 +329,39 @@ export class EscrowGateClient {
   }
 
   /**
+   * Watches lifecycle events for one escrow as an asynchronous iterator.
+   *
+   * The stream begins at the RPC's latest closed ledger and yields later
+   * events in ledger order. It polls every four seconds by default, retries
+   * transient RPC failures with bounded exponential backoff, and deduplicates
+   * overlapping pages using ledger, transaction, operation, and event IDs.
+   * Call the iterator's `return()` method (or break from `for await`) to stop
+   * polling and clear its timer.
+   *
+   * @param escrowId - Positive escrow identifier stored by the contract as a
+   *   `u64`; escrow IDs begin at `1n`.
+   * @param options - Optional polling, timeout, and RPC transport settings.
+   * @returns An independent asynchronous iterator of decoded escrow events.
+   * @throws {RangeError} If `escrowId` is not a positive `u64` bigint or a
+   *   supplied polling option is invalid.
+   *
+   * @example
+   * ```ts
+   * const events = client.watchEscrow(42n);
+   * for await (const event of events) {
+   *   console.log(event.type, event.metadata.txHash);
+   *   if (event.type === "disbursed") break;
+   * }
+   * ```
+   */
+  public watchEscrow(
+    escrowId: bigint,
+    options: WatchEscrowOptions = {}
+  ): AsyncIterableIterator<EscrowEvent> {
+    return createEscrowEventIterator(escrowId, this.config, options);
+  }
+
+  /**
    * Builds arguments for the contract's `init` method.
    *
    * @param admin - Stellar account that will administer the contract.
@@ -603,3 +638,12 @@ export * from "./units";
 export * from "./sep38";
 export * from "./ttl";
 export * from "./encoding";
+export { EscrowEventStreamError } from "./events";
+export type {
+  EscrowEvent,
+  EscrowEventBase,
+  EscrowEventMetadata,
+  EscrowEventRpcServer,
+  EscrowEventStreamErrorKind,
+  WatchEscrowOptions,
+} from "./events";

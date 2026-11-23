@@ -1,0 +1,199 @@
+# Default values for soroban-relay.
+# This is a YAML-formatted file. Declare variables to be passed into your templates.
+
+# --- Global labels / annotations applied to all workloads ---
+global: {}
+  # namespace: soroban
+  # labels:
+  #   app.kubernetes.io/part-of: soroban-anchor-gate
+  #   environment: production
+
+# --- Image configuration ---
+image:
+  repository: soroban-anchor-gate/relay
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: ""
+
+# --- Deployment / replica configuration ---
+replicaCount: 1
+
+# Strategy for rolling updates.
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+# --- Pod configuration ---
+podAnnotations: {}
+  # prometheus.io/scrape: "true"
+  # prometheus.io/port: "8080"
+
+podLabels: {}
+  # environment: production
+
+# --- Container ports ---
+containerPort: 8080
+
+# --- Environment variables passed to the relay container ---
+# Secrets such as RELAY_SIGNER_KEY, DATABASE_URL, and webhook subscriber
+# tokens should be injected via the Secret template (see templates/secret.yaml)
+# and referenced here by name.
+env:
+  # Stellar RPC / event ingestion
+  - name: STELLAR_RPC_URL
+    value: "https://rpc-friendsubnet.stellar.org:443"
+  - name: STELLAR_CONTRACT_ID
+    value: ""
+  # Postgres connection (password injected from secret)
+  - name: DATABASE_URL
+    valueFrom:
+      secretKeyRef:
+        name: soroban-relay-secrets
+        key: database-url
+  # Signer key for outgoing request signing (HMAC/Ed25519)
+  - name: RELAY_SIGNER_KEY
+    valueFrom:
+      secretKeyRef:
+        name: soroban-relay-secrets
+        key: signer-key
+  # Optional: log level
+  - name: LOG_LEVEL
+    value: "info"
+  # Optional: HTTP listen port
+  - name: HTTP_LISTEN_PORT
+    value: "8080"
+
+# --- Resource limits / requests ---
+resources: {}
+  # We usually recommend not to specify default resources and to leave this as a
+  # conscious choice for the user. This increases the chance the chart runs on
+  # environments with minimal resource constraints.
+  # limits:
+  #   cpu: 500m
+  #   memory: 256Mi
+  # requests:
+  #   cpu: 100m
+  #   memory: 128Mi
+
+# --- Liveness / readiness probes ---
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+# --- Service configuration ---
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: http
+  annotations: {}
+  labels: {}
+
+# --- Ingress (optional, disabled by default) ---
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # nginx.ingress.kubernetes.io/ssl-redirect: "true"
+  hosts:
+    - host: relay.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: relay-tls
+  #    hosts:
+  #      - relay.local
+
+# --- HorizontalPodAutoscaler configuration ---
+autoscaling:
+  enabled: true
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+  # Behavior tuning (requires k8s >= 1.23 for HPA v2 behavior fields)
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+
+# --- Secret configuration ---
+# NOTE: Values under `secrets.data` are base64-encoded by Helm when rendered into
+# a Secret. For production, prefer injecting real secrets via an external secret
+# manager (e.g. ExternalSecrets, Sealed Secrets) rather than committing them here.
+secrets:
+  enabled: true
+  name: soroban-relay-secrets
+  annotations: {}
+  labels: {}
+  data:
+    database-url: ""
+    signer-key: ""
+
+# --- ConfigMap configuration ---
+configmap:
+  enabled: true
+  name: soroban-relay-config
+  annotations: {}
+  labels: {}
+  data: {}
+    # relay.yaml: |
+    #   rpc_url: https://rpc-friendsubnet.stellar.org:443
+    #   contract_id: ""
+    #   log_level: info
+
+# --- PersistentVolumeClaim (optional, disabled by default) ---
+# The relay stores idempotency state durably; enable a PVC if you need
+# crash-recovery of processed events across restarts.
+persistence:
+  enabled: false
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 1Gi
+  mountPath: /data
+
+# --- Node / toleration / affinity configuration ---
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# --- Security context ---
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL

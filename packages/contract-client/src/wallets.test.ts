@@ -13,8 +13,8 @@ import {
   WalletError,
   XBullAdapter,
   isWalletError,
-  readErrorMessage,
 } from "./wallets";
+import { readErrorMessage } from "./wallets/types";
 import type {
   AlbedoProvider,
   FreighterApi,

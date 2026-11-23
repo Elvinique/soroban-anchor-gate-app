@@ -16,16 +16,7 @@
  * @packageDocumentation
  */
 
-export {
-  WalletError,
-  isWalletError,
-  isRecord,
-  readString,
-  readErrorMessage,
-  isRejectionMessage,
-  isBase64Envelope,
-  assertSignRequest,
-} from "./types";
+export { WalletError, isWalletError } from "./types";
 export type {
   WalletAdapter,
   WalletConnection,

@@ -279,7 +279,8 @@ export function buildUnsignedXDR(invocation: ContractCall): string {
 /**
  * Decodes a base64 transaction envelope for inspection or round-trip tests.
  *
- * @param xdr - Base64 envelope produced by {@link buildUnsignedXDR} or a wallet.
+ * @param transactionXDR - Base64 envelope produced by {@link buildUnsignedXDR}
+ *   or returned by a wallet.
  * @param networkPassphrase - Passphrase the envelope is bound to.
  * @returns The parsed transaction or fee-bump transaction.
  * @throws {Error} If the XDR or passphrase is invalid, or the envelope cannot

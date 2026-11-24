@@ -168,12 +168,12 @@ type DeadLetterHandler func(entry DeadLetterEntry)
 // Dispatcher delivers events to registered webhook subscribers with HMAC-SHA256
 // authentication, exponential backoff retries, and dead-lettering.
 type Dispatcher struct {
-	subscribers map[string]*Subscriber
-	mu          sync.RWMutex
-	httpClient  *http.Client
-	backoff     BackoffPolicy
-	deadLetter  []DeadLetterEntry
-	dlMu        sync.Mutex
+	subscribers  map[string]*Subscriber
+	mu           sync.RWMutex
+	httpClient   *http.Client
+	backoff      BackoffPolicy
+	deadLetter   []DeadLetterEntry
+	dlMu         sync.Mutex
 	onDeadLetter DeadLetterHandler
 }
 
@@ -465,5 +465,3 @@ func (m *MultiError) Error() string {
 	}
 	return msg
 }
-
-

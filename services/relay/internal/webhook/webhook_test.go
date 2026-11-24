@@ -64,12 +64,12 @@ func TestHeaderFormat(t *testing.T) {
 
 // recordingServer captures requests and their headers/bodies.
 type recordingServer struct {
-	mu       sync.Mutex
-	reqs     []*http.Request
-	status   int
-	body     string
-	delay    time.Duration
-	failN    int // fail the first failN requests with 500, then succeed
+	mu        sync.Mutex
+	reqs      []*http.Request
+	status    int
+	body      string
+	delay     time.Duration
+	failN     int // fail the first failN requests with 500, then succeed
 	failCount int
 }
 

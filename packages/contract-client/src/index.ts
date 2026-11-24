@@ -11,6 +11,7 @@
  */
 
 import {
+  Account,
   Address,
   Contract,
   Operation,
@@ -23,13 +24,21 @@ import {
 import { createHash } from "crypto";
 import { createEscrowEventIterator } from "./events";
 import type { EscrowEvent, WatchEscrowOptions } from "./events";
+import { validateNetworkConfig, validateRpcUrl } from "./config";
+import type { NetworkName } from "./config";
 
 /**
  * Connection and network settings required by {@link EscrowGateClient}.
+ *
+ * The optional `network` identity is available when settings come from
+ * {@link createClientConfig}. Existing callers may continue to provide their
+ * own RPC URL and passphrase without it.
  */
 export interface ClientConfig {
   /** Soroban contract ID encoded as a Stellar `C...` contract address. */
   contractId: string;
+  /** Selected preset identity when using a network configuration. */
+  network?: NetworkName;
   /** Soroban RPC endpoint used to simulate and submit transactions. */
   rpcUrl: string;
   /** Stellar network passphrase, for example `Test SDF Network ; September 2015`. */
@@ -177,15 +186,20 @@ export interface EscrowRecordView {
  * ```
  */
 export function validateClientConfig(config: ClientConfig): void {
+  if (!config || typeof config !== "object") {
+    throw new TypeError("Client configuration is required");
+  }
   if (!config.contractId || !StrKey.isValidContract(config.contractId)) {
     throw new Error(`Invalid contract ID format: ${config.contractId}`);
   }
-  if (!config.rpcUrl || !config.rpcUrl.startsWith("http")) {
-    throw new Error(`Invalid RPC URL: ${config.rpcUrl}`);
-  }
-  if (!config.networkPassphrase || config.networkPassphrase.trim() === "") {
+  validateRpcUrl(config.rpcUrl);
+  if (
+    typeof config.networkPassphrase !== "string" ||
+    config.networkPassphrase.trim() === ""
+  ) {
     throw new Error("Network passphrase cannot be empty");
   }
+  if (config.network !== undefined) validateNetworkConfig(config);
 }
 
 /**
@@ -359,6 +373,33 @@ export class EscrowGateClient {
     options: WatchEscrowOptions = {}
   ): AsyncIterableIterator<EscrowEvent> {
     return createEscrowEventIterator(escrowId, this.config, options);
+  }
+
+  /**
+   * Creates an unsigned transaction builder using this client's configured
+   * network passphrase. The caller remains responsible for adding operations,
+   * applying a timeout, signing, and submitting through their chosen flow.
+   *
+   * @param sourceAccount - Transaction source account and sequence number.
+   * @param fee - Base fee in stroops; defaults to `100`.
+   * @returns A Stellar SDK builder bound to this client's network.
+   * @example
+   * ```ts
+   * const transaction = client
+   *   .createTransactionBuilder(sourceAccount)
+   *   .addOperation(client.buildOperation("get_counter", []))
+   *   .setTimeout(30)
+   *   .build();
+   * ```
+   */
+  public createTransactionBuilder(
+    sourceAccount: Account,
+    fee: string = "100"
+  ): TransactionBuilder {
+    return new TransactionBuilder(sourceAccount, {
+      fee,
+      networkPassphrase: this.config.networkPassphrase,
+    });
   }
 
   /**
@@ -634,6 +675,29 @@ export class EscrowGateClient {
 }
 
 export * from "./crypto";
+export { EscrowEventStreamError } from "./events";
+export type {
+  EscrowEvent,
+  EscrowEventBase,
+  EscrowEventMetadata,
+  EscrowEventRpcServer,
+  EscrowEventStreamErrorKind,
+  WatchEscrowOptions,
+} from "./events";
+export {
+  createClientConfig,
+  createNetworkConfig,
+  MAINNET,
+  STANDALONE,
+  TESTNET,
+  validateNetworkConfig,
+} from "./config";
+export type {
+  NetworkConfig,
+  NetworkConfigOverrides,
+  NetworkName,
+  NetworkPassphrase,
+} from "./config";
 export * from "./units";
 export * from "./sep38";
 export * from "./ttl";

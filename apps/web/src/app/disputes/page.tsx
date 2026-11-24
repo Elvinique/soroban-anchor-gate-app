@@ -7,6 +7,7 @@ import { buildResolveDisputeContractCall } from "@/lib/transaction";
 import { Button } from "@/components/ui/button";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { MobileNav } from "@/components/MobileNav";
 import {
   DisputeSlider,
   computeSplit,
@@ -94,6 +95,7 @@ export default function DisputesPage() {
 
   return (
     <div className="space-y-6">
+      <MobileNav />
       <Card>
         <CardHeader>
           <div className="flex items-center gap-2">

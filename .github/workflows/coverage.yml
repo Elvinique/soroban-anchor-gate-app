@@ -1,0 +1,251 @@
+name: Code Coverage
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  COVERAGE_THRESHOLD: "85"
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 1 — Soroban contract coverage (cargo llvm-cov)
+  # ═══════════════════════════════════════════════════════════════════════════
+  contracts-coverage:
+    name: Contracts Coverage (Rust)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Generate contract coverage
+        working-directory: contracts
+        run: |
+          mkdir -p coverage
+          cargo llvm-cov --lcov \
+            --output-path coverage/rust.lcov \
+            --fail-under-lines "$COVERAGE_THRESHOLD"
+
+      - name: Upload contract coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-contracts
+          path: contracts/coverage/rust.lcov
+          if-no-files-found: error
+          retention-days: 7
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 2 — Go relay coverage (go test -coverprofile)
+  # ═══════════════════════════════════════════════════════════════════════════
+  relay-coverage:
+    name: Relay Coverage (Go)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.22"
+          cache-dependency-path: services/relay/go.sum
+
+      - name: Generate relay coverage
+        working-directory: services/relay
+        run: |
+          mkdir -p coverage
+          go test -race -covermode=atomic -coverprofile=coverage/go-coverage.txt ./...
+          go tool cover -func=coverage/go-coverage.txt | tee coverage/summary.txt
+
+      - name: Enforce relay coverage threshold
+        working-directory: services/relay
+        run: |
+          total=$(awk '/^total:/ { gsub(/%/, "", $NF); print $NF }' coverage/summary.txt)
+          echo "Go relay coverage: ${total}%"
+          awk -v total="$total" -v threshold="$COVERAGE_THRESHOLD" 'BEGIN {
+            if (total == "" || total + 0 < threshold + 0) {
+              printf "Relay coverage %s%% is below the required %s%% threshold\n", total, threshold
+              exit 1
+            }
+          }'
+
+      - name: Upload relay coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-relay
+          path: services/relay/coverage/go-coverage.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 3 — Next.js web coverage
+  # The repo uses Node's built-in test runner (via tsx) rather than jest, so
+  # coverage comes from Node's V8 coverage engine and is emitted as lcov.
+  # ═══════════════════════════════════════════════════════════════════════════
+  web-coverage:
+    name: Web Coverage (TypeScript)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install web dependencies
+        working-directory: apps/web
+        run: npm ci
+
+      - name: Generate web coverage
+        working-directory: apps/web
+        run: |
+          mkdir -p coverage
+          node --import tsx --test \
+            --experimental-test-coverage \
+            --test-coverage-include='src/**/*.ts' \
+            --test-coverage-exclude='src/**/*.test.ts' \
+            --test-reporter=lcov \
+            --test-reporter-destination=coverage/web.lcov \
+            src/lib/*.test.ts
+
+      - name: Enforce web coverage threshold
+        working-directory: apps/web
+        run: |
+          awk -F: -v threshold="$COVERAGE_THRESHOLD" '
+            /^LF:/ { lf += $2 }
+            /^LH:/ { lh += $2 }
+            END {
+              percent = (lf > 0) ? (lh * 100) / lf : 0
+              printf "Web coverage: %.2f%%\n", percent
+              if (percent < threshold) exit 1
+            }
+          ' coverage/web.lcov
+
+      - name: Upload web coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-web
+          path: apps/web/coverage/web.lcov
+          if-no-files-found: error
+          retention-days: 7
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 4 — Contract client SDK coverage
+  # The SDK compiles with tsc and runs node --test, so V8 coverage is collected
+  # from the compiled dist output instead of jest.
+  # ═══════════════════════════════════════════════════════════════════════════
+  contract-client-coverage:
+    name: Contract Client Coverage (TypeScript)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: packages/contract-client/package-lock.json
+
+      - name: Install SDK dependencies
+        working-directory: packages/contract-client
+        run: npm ci
+
+      - name: Generate contract client coverage
+        working-directory: packages/contract-client
+        run: |
+          mkdir -p coverage
+          node node_modules/typescript/lib/tsc.js
+          node --test \
+            --experimental-test-coverage \
+            --test-coverage-include='dist/**/*.js' \
+            --test-coverage-exclude='dist/**/*.test.js' \
+            --test-reporter=lcov \
+            --test-reporter-destination=coverage/contract-client.lcov \
+            dist/*.test.js
+
+      - name: Enforce contract client coverage threshold
+        working-directory: packages/contract-client
+        run: |
+          awk -F: -v threshold="$COVERAGE_THRESHOLD" '
+            /^LF:/ { lf += $2 }
+            /^LH:/ { lh += $2 }
+            END {
+              percent = (lf > 0) ? (lh * 100) / lf : 0
+              printf "Contract client coverage: %.2f%%\n", percent
+              if (percent < threshold) exit 1
+            }
+          ' coverage/contract-client.lcov
+
+      - name: Upload contract client coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-contract-client
+          path: packages/contract-client/coverage/contract-client.lcov
+          if-no-files-found: error
+          retention-days: 7
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 5 — Unified Codecov upload
+  # ═══════════════════════════════════════════════════════════════════════════
+  codecov-upload:
+    name: Upload Unified Coverage to Codecov
+    needs:
+      - contracts-coverage
+      - relay-coverage
+      - web-coverage
+      - contract-client-coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Download coverage artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: coverage-artifacts
+          merge-multiple: true
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: |
+            coverage-artifacts/rust.lcov
+            coverage-artifacts/go-coverage.txt
+            coverage-artifacts/web.lcov
+            coverage-artifacts/contract-client.lcov
+          flags: unittests
+          name: unified-coverage
+          fail_ci_if_error: true
+          verbose: true

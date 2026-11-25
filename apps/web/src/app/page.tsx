@@ -24,8 +24,11 @@ import {
   Scale,
   Coins,
   History,
+  Table,
 } from "lucide-react";
 import { SorobanAnchorLogo } from "@/components/Logo";
+import { EscrowTable } from "@/components/EscrowTable";
+import type { EscrowRow } from "@/components/EscrowTable";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -60,6 +63,49 @@ export type EscrowStatusState =
   | "pending"
   | "confirmed"
   | "failed";
+
+const SAMPLE_ESCROWS: EscrowRow[] = [
+  {
+    id: "E-001",
+    recipient: "GAAAAA1111111111111111111111111111111111111111111111111111",
+    token: "XLM",
+    amount: 1000,
+    status: "Funded",
+    createdAt: "2026-01-10T10:00:00Z",
+  },
+  {
+    id: "E-002",
+    recipient: "GBBBBB2222222222222222222222222222222222222222222222222222",
+    token: "USDC",
+    amount: 500,
+    status: "Disbursed",
+    createdAt: "2026-01-15T12:00:00Z",
+  },
+  {
+    id: "E-003",
+    recipient: "GCCCCC3333333333333333333333333333333333333333333333333333",
+    token: "XLM",
+    amount: 2000,
+    status: "Disputed",
+    createdAt: "2026-02-01T09:00:00Z",
+  },
+  {
+    id: "E-004",
+    recipient: "GDDDDD4444444444444444444444444444444444444444444444444444",
+    token: "USDC",
+    amount: 750,
+    status: "Refunded",
+    createdAt: "2026-02-05T14:00:00Z",
+  },
+  {
+    id: "E-005",
+    recipient: "GEEEEE5555555555555555555555555555555555555555555555555555",
+    token: "XLM",
+    amount: 1500,
+    status: "Funded",
+    createdAt: "2026-03-01T08:00:00Z",
+  },
+];
 
 export default function HomePage() {
   const config = getAppConfig();
@@ -890,6 +936,25 @@ export default function HomePage() {
                     Go Daemon (Durable Soroban Listener)
                   </span>
                 </div>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader>
+                <div className="flex items-center gap-2">
+                  <div className="p-2 rounded-lg bg-secondary/20 text-secondary-foreground border border-secondary/30">
+                    <Table className="w-5 h-5 text-primary" />
+                  </div>
+                  <div>
+                    <CardTitle>Escrow Dashboard</CardTitle>
+                    <CardDescription>
+                      Searchable, filterable, sortable escrow records.
+                    </CardDescription>
+                  </div>
+                </div>
+              </CardHeader>
+              <CardContent className="p-0">
+                <EscrowTable data={SAMPLE_ESCROWS} pageSize={10} />
               </CardContent>
             </Card>
           </div>

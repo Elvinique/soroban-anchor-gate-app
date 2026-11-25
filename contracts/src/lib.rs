@@ -9,7 +9,7 @@ mod test;
 use crate::errors::EscrowError;
 use crate::types::{
     DataKey, DisbursementCommitment, EscrowEntry, EscrowInitParams, EscrowRecord, EscrowStatus,
-    EscrowStream, EscrowTerms, VolumeTracker, WhitelistProposal,
+    EscrowStream, EscrowTerms, SettlementProposal, VolumeTracker, WhitelistProposal,
 };
 use soroban_sdk::{
     contract, contractclient, contractimpl, symbol_short, token, Address, Bytes, BytesN, Env,

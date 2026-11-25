@@ -257,9 +257,11 @@ export function useTokenBalance(
     refreshKey,
   } = options;
 
-  const [snapshot, setSnapshot] = useState<TokenBalanceSnapshot | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<{
+    key: string;
+    snapshot: TokenBalanceSnapshot | null;
+    error: string | null;
+  } | null>(null);
   const [nonce, setNonce] = useState(0);
 
   const refresh = useCallback(() => setNonce((value) => value + 1), []);
@@ -267,39 +269,54 @@ export function useTokenBalance(
   const assetCode = asset?.code;
   const assetIssuer = asset?.issuer;
 
+  /**
+   * Identity of the balance lookup currently requested. Changing it starts a
+   * new fetch, so pending state is derived by comparing it with the result
+   * that has been stored rather than by setting state synchronously in the
+   * effect body.
+   */
+  const requestKey = JSON.stringify([
+    account ?? null,
+    horizonUrl,
+    assetCode ?? null,
+    assetIssuer ?? null,
+    String(nonce),
+    String(refreshKey ?? null),
+  ]);
+
   useEffect(() => {
     if (!account) return;
 
     let cancelled = false;
+    const key = requestKey;
 
-    // Kick the request off on a microtask: setting state synchronously in an
-    // effect body triggers cascading renders, but the fetch still starts as
-    // soon as the current render commits.
-    void Promise.resolve().then(() => {
-      if (cancelled) return;
-      setLoading(true);
-      fetchAccountBalances(horizonUrl, account)
-        .then((payload) => {
-          if (cancelled) return;
-          setSnapshot(
-            parseHorizonAccount(payload, { code: assetCode, issuer: assetIssuer })
-          );
-          setError(null);
-        })
-        .catch((err: unknown) => {
-          if (cancelled) return;
-          setSnapshot(null);
-          setError(err instanceof Error ? err.message : "Balance lookup failed");
-        })
-        .finally(() => {
-          if (!cancelled) setLoading(false);
+    fetchAccountBalances(horizonUrl, account)
+      .then((payload) => {
+        if (cancelled) return;
+        setResult({
+          key,
+          snapshot: parseHorizonAccount(payload, { code: assetCode, issuer: assetIssuer }),
+          error: null,
         });
-    });
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setResult({
+          key,
+          snapshot: null,
+          error: err instanceof Error ? err.message : "Balance lookup failed",
+        });
+      });
 
     return () => {
       cancelled = true;
     };
-  }, [account, horizonUrl, assetCode, assetIssuer, nonce, refreshKey]);
+  }, [account, horizonUrl, assetCode, assetIssuer, requestKey]);
+
+  const settled = result && result.key === requestKey ? result : null;
+  const snapshot = account ? settled?.snapshot ?? null : null;
+  const error = account ? settled?.error ?? null : null;
+  const loading = Boolean(account) && settled === null;
 
   // With no wallet connected the hook reports the empty state directly, so the
   // effect never has to reset state synchronously before fetching.

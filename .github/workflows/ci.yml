@@ -10,6 +10,7 @@ jobs:
   contracts-checks:
     name: Soroban Smart Contracts Checks
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
@@ -44,9 +45,148 @@ jobs:
           cd contracts
           cargo build --target wasm32-unknown-unknown --release
 
+  contract-wasm-optimization:
+    name: Soroban Contract WASM Optimization & Verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      WASM_MAX_BYTES: '65536'
+      STELLAR_CLI_VERSION: '^22.0'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo Dependencies & Stellar CLI
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/stellar
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            contracts/target
+          key: ${{ runner.os }}-wasm-opt-${{ hashFiles('contracts/Cargo.lock') }}-${{ env.STELLAR_CLI_VERSION }}
+          restore-keys: |
+            ${{ runner.os }}-wasm-opt-${{ hashFiles('contracts/Cargo.lock') }}-
+            ${{ runner.os }}-wasm-opt-
+
+      - name: Install Soroban / Stellar CLI
+        run: |
+          set -euo pipefail
+          if ! command -v soroban >/dev/null 2>&1 && ! command -v stellar >/dev/null 2>&1; then
+            cargo install --locked stellar-cli --version "$STELLAR_CLI_VERSION"
+          fi
+          if command -v soroban >/dev/null 2>&1; then
+            soroban --version
+          else
+            stellar --version
+          fi
+
+      - name: Build, Optimize & Verify Contract WASM
+        run: |
+          set -euo pipefail
+          WASM_DIR="contracts/target/wasm32-unknown-unknown/release"
+          RAW_WASM="${WASM_DIR}/soroban_anchor_escrow.wasm"
+          OPT_WASM="${WASM_DIR}/soroban_anchor_escrow.optimized.wasm"
+
+          if command -v soroban >/dev/null 2>&1; then
+            CLI_BIN="soroban"
+          elif command -v stellar >/dev/null 2>&1; then
+            CLI_BIN="stellar"
+          else
+            echo "::error::Neither soroban nor stellar CLI is installed."
+            exit 1
+          fi
+
+          build_and_optimize() {
+            rm -f "$OPT_WASM"
+            (
+              cd contracts
+              CARGO_INCREMENTAL=0 \
+              RUSTFLAGS="--remap-path-prefix=${PWD}=/workspace" \
+              cargo build --locked --target wasm32-unknown-unknown --release
+              "$CLI_BIN" contract optimize --wasm "target/wasm32-unknown-unknown/release/soroban_anchor_escrow.wasm"
+            )
+          }
+
+          echo "=== Pass 1: Initial release build & WASM optimization ==="
+          build_and_optimize
+          HASH_1=$(sha256sum "$OPT_WASM" | awk '{print $1}')
+
+          echo "=== Pass 2: Clean contract rebuild for reproducibility verification ==="
+          (cd contracts && cargo clean -p soroban-anchor-escrow)
+          build_and_optimize
+          HASH_2=$(sha256sum "$OPT_WASM" | awk '{print $1}')
+
+          if [ "$HASH_1" != "$HASH_2" ]; then
+            echo "::error::Non-reproducible WASM build detected (${HASH_1} != ${HASH_2})"
+            exit 1
+          fi
+          echo "Reproducible optimized WASM hash verified: ${HASH_1}"
+
+          RAW_SIZE=$(wc -c < "$RAW_WASM" | tr -d '[:space:]')
+          OPT_SIZE=$(wc -c < "$OPT_WASM" | tr -d '[:space:]')
+
+          if [ "$OPT_SIZE" -le 0 ]; then
+            echo "::error::Optimized WASM binary is empty (0 bytes)."
+            exit 1
+          fi
+
+          if [ "$OPT_SIZE" -ge "$WASM_MAX_BYTES" ]; then
+            echo "::error::Optimized WASM size (${OPT_SIZE} bytes) meets or exceeds limit (< ${WASM_MAX_BYTES} bytes)."
+            exit 1
+          fi
+
+          echo "Release WASM size:   ${RAW_SIZE} bytes"
+          echo "Optimized WASM size: ${OPT_SIZE} bytes (< ${WASM_MAX_BYTES} bytes limit)"
+
+          (
+            cd "$WASM_DIR"
+            sha256sum soroban_anchor_escrow.wasm soroban_anchor_escrow.optimized.wasm > SHA256SUMS.txt
+            sha256sum -c SHA256SUMS.txt
+          )
+
+          {
+            echo "rustc=$(rustc --version)"
+            echo "cli=$("$CLI_BIN" --version)"
+            echo "raw_bytes=${RAW_SIZE}"
+            echo "optimized_bytes=${OPT_SIZE}"
+            echo "max_bytes=${WASM_MAX_BYTES}"
+            echo "reproducible=true"
+          } > "${WASM_DIR}/BUILD_METADATA.txt"
+
+          {
+            echo "### Soroban Contract WASM Verification"
+            echo ""
+            echo "| Metric | Value |"
+            echo "| :--- | :--- |"
+            echo "| Release WASM Size | \`${RAW_SIZE}\` bytes |"
+            echo "| Optimized WASM Size | \`${OPT_SIZE}\` bytes (limit \`< ${WASM_MAX_BYTES}\`) |"
+            echo "| Reproducible Build | Verified (\`${HASH_1}\`) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Archive Optimized WASM & SHA-256 Checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: soroban-contract-wasm-artifacts
+          path: |
+            contracts/target/wasm32-unknown-unknown/release/soroban_anchor_escrow.wasm
+            contracts/target/wasm32-unknown-unknown/release/soroban_anchor_escrow.optimized.wasm
+            contracts/target/wasm32-unknown-unknown/release/SHA256SUMS.txt
+            contracts/target/wasm32-unknown-unknown/release/BUILD_METADATA.txt
+          retention-days: 30
+          if-no-files-found: error
+
   contract-client-checks:
     name: TypeScript Contract Client SDK Checks
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
@@ -78,6 +218,7 @@ jobs:
   web-frontend-checks:
     name: Next.js Web Frontend Checks
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
@@ -116,6 +257,7 @@ jobs:
   go-relay-checks:
     name: Go Relay Service Checks
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 

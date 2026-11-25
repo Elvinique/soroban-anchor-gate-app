@@ -10,7 +10,7 @@
  * ```
  *
  * This module turns every code declared by `contracts/src/errors.rs`
- * (`EscrowError`, `#1`–`#26`) into a dedicated {@link ContractError} subclass
+ * (`EscrowError`, `#1`–`#30`) into a dedicated {@link ContractError} subclass
  * carrying:
  *
  * - the stable numeric `code` and the Rust enum `errorName`,
@@ -92,6 +92,14 @@ export enum ContractErrorCode {
   HourlyVolumeLimitExceeded = 25,
   /** The configured volume limit is invalid. */
   InvalidVolumeLimit = 26,
+  /** The contract blocked a re-entrant call. */
+  ReentrancyDetected = 27,
+  /** The supplied preimage does not match the escrow's hashlock. */
+  InvalidPreimage = 28,
+  /** The escrow has no hashlock configured. */
+  HashlockNotSet = 29,
+  /** The escrow's secondary beneficiary is not registered. */
+  SecondaryBeneficiaryNotFound = 30,
 }
 
 /**
@@ -304,6 +312,34 @@ export const CONTRACT_ERROR_DEFINITIONS: readonly ContractErrorDefinition[] = [
     description: "The configured volume limit is invalid.",
     remediation:
       "Set a non-negative integer volume limit and ensure it is stored in the token's smallest unit.",
+  },
+  {
+    code: ContractErrorCode.ReentrancyDetected,
+    name: "ReentrancyDetected",
+    description: "The contract blocked a re-entrant call.",
+    remediation:
+      "Retry the operation without nesting contract calls; the re-entrancy guard rejects nested entry until the outer call returns.",
+  },
+  {
+    code: ContractErrorCode.InvalidPreimage,
+    name: "InvalidPreimage",
+    description: "The supplied preimage does not match the escrow's hashlock.",
+    remediation:
+      "Verify the preimage hashes to the value committed when the hashlock was configured, then retry the release.",
+  },
+  {
+    code: ContractErrorCode.HashlockNotSet,
+    name: "HashlockNotSet",
+    description: "The escrow has no hashlock configured.",
+    remediation:
+      "Configure the hashlock before attempting a hashlocked release, or use the time-based release path instead.",
+  },
+  {
+    code: ContractErrorCode.SecondaryBeneficiaryNotFound,
+    name: "SecondaryBeneficiaryNotFound",
+    description: "The escrow's secondary beneficiary is not registered.",
+    remediation:
+      "Register a secondary beneficiary on the escrow before relying on fallback routing.",
   },
 ];
 
@@ -610,6 +646,47 @@ export class InvalidVolumeLimitError extends ContractError {
   }
 }
 
+/** Raised when the contract blocks a re-entrant call. */
+export class ReentrancyDetectedError extends ContractError {
+  constructor(details: ContractErrorDetails = {}) {
+    super(
+      CONTRACT_ERROR_CATALOG[ContractErrorCode.ReentrancyDetected],
+      details
+    );
+    this.name = "ReentrancyDetectedError";
+  }
+}
+
+/** Raised when a hashlock preimage does not match the commitment. */
+export class InvalidPreimageError extends ContractError {
+  constructor(details: ContractErrorDetails = {}) {
+    super(
+      CONTRACT_ERROR_CATALOG[ContractErrorCode.InvalidPreimage],
+      details
+    );
+    this.name = "InvalidPreimageError";
+  }
+}
+
+/** Raised when a hashlocked release is attempted without a hashlock. */
+export class HashlockNotSetError extends ContractError {
+  constructor(details: ContractErrorDetails = {}) {
+    super(CONTRACT_ERROR_CATALOG[ContractErrorCode.HashlockNotSet], details);
+    this.name = "HashlockNotSetError";
+  }
+}
+
+/** Raised when fallback routing cannot find the secondary beneficiary. */
+export class SecondaryBeneficiaryNotFoundError extends ContractError {
+  constructor(details: ContractErrorDetails = {}) {
+    super(
+      CONTRACT_ERROR_CATALOG[ContractErrorCode.SecondaryBeneficiaryNotFound],
+      details
+    );
+    this.name = "SecondaryBeneficiaryNotFoundError";
+  }
+}
+
 /**
  * Fallback for a numeric code the SDK does not know yet.
  *
@@ -739,6 +816,14 @@ export function contractErrorFromCode(
       return new HourlyVolumeLimitExceededError(details);
     case ContractErrorCode.InvalidVolumeLimit:
       return new InvalidVolumeLimitError(details);
+    case ContractErrorCode.ReentrancyDetected:
+      return new ReentrancyDetectedError(details);
+    case ContractErrorCode.InvalidPreimage:
+      return new InvalidPreimageError(details);
+    case ContractErrorCode.HashlockNotSet:
+      return new HashlockNotSetError(details);
+    case ContractErrorCode.SecondaryBeneficiaryNotFound:
+      return new SecondaryBeneficiaryNotFoundError(details);
     default:
       return new UnknownContractError(code, details);
   }

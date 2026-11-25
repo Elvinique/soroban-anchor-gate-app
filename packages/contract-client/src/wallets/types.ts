@@ -8,6 +8,8 @@
  * @packageDocumentation
  */
 
+import { StrKey, xdr } from "@stellar/stellar-sdk";
+
 /** Identifier of a supported wallet integration. */
 export type WalletId = "freighter" | "xbull" | "albedo" | "mock";
 
@@ -163,16 +165,42 @@ export function readString(
 }
 
 /**
+ * Reports whether a plain string is a successful wallet payload rather than an
+ * error description.
+ *
+ * Vendors such as Freighter v1, xBull's legacy `sign`, and Albedo's plain
+ * responses return the account address or the signed envelope as a bare string,
+ * so those must not be mistaken for failure text.
+ *
+ * @param text - Trimmed response string.
+ */
+function isSuccessPayloadString(text: string): boolean {
+  if (StrKey.isValidEd25519PublicKey(text)) return true;
+  try {
+    xdr.TransactionEnvelope.fromXDR(text, "base64");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Extracts a user-facing message from an extension error envelope.
  *
  * Wallets return either `{ error: "text" }`, `{ error: { message: "text" } }`,
- * or plain strings, so all three shapes are accepted.
+ * or plain strings, so all three shapes are accepted. Plain strings that are a
+ * valid account address or transaction envelope are treated as success payloads
+ * and produce no message.
  *
  * @param value - Wallet response or thrown value.
  * @returns The message, or `undefined` when none can be read.
  */
 export function readErrorMessage(value: unknown): string | undefined {
-  if (typeof value === "string") return value;
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (text === "") return undefined;
+    return isSuccessPayloadString(text) ? undefined : text;
+  }
   if (value instanceof Error) return value.message || value.name;
   const direct = readString(value, "message", "error", "reason");
   if (direct) return direct;

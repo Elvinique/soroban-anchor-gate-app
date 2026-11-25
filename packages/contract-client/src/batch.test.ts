@@ -70,7 +70,8 @@ describe("buildUnsignedXDR", () => {
       throw new Error("expected a single transaction envelope");
     }
     assert.equal(decoded.source, call.sourceAccount);
-    assert.equal(decoded.sequence, call.sequence);
+    // The builder advances the supplied account sequence by one.
+    assert.equal(decoded.sequence, String(BigInt(call.sequence) + 1n));
     assert.equal(decoded.operations.length, 1);
     assert.equal(decoded.operations[0].type, "invokeHostFunction");
     assert.equal(decoded.signatures.length, 0);
@@ -111,7 +112,12 @@ describe("buildUnsignedXDR", () => {
     if (decoded instanceof FeeBumpTransaction) throw new Error("unexpected");
     assert.equal(decoded.fee, "250");
     assert.equal(decoded.memo.type, "text");
-    assert.equal(String(decoded.memo.value), "batch-1");
+    const memoValue = decoded.memo.value;
+    const memoText =
+      typeof memoValue === "string"
+        ? memoValue
+        : new TextDecoder().decode(memoValue as unknown as Uint8Array);
+    assert.equal(memoText, "batch-1");
     assert.equal(decoded.operations.length, 1);
   });
 

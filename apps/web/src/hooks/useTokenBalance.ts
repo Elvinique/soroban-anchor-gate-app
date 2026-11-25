@@ -268,39 +268,48 @@ export function useTokenBalance(
   const assetIssuer = asset?.issuer;
 
   useEffect(() => {
-    if (!account) {
-      setSnapshot(null);
-      setError(null);
-      setLoading(false);
-      return;
-    }
+    if (!account) return;
 
     let cancelled = false;
-    setLoading(true);
 
-    fetchAccountBalances(horizonUrl, account)
-      .then((payload) => {
-        if (cancelled) return;
-        setSnapshot(parseHorizonAccount(payload, { code: assetCode, issuer: assetIssuer }));
-        setError(null);
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        setSnapshot(null);
-        setError(err instanceof Error ? err.message : "Balance lookup failed");
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
+    // Kick the request off on a microtask: setting state synchronously in an
+    // effect body triggers cascading renders, but the fetch still starts as
+    // soon as the current render commits.
+    void Promise.resolve().then(() => {
+      if (cancelled) return;
+      setLoading(true);
+      fetchAccountBalances(horizonUrl, account)
+        .then((payload) => {
+          if (cancelled) return;
+          setSnapshot(
+            parseHorizonAccount(payload, { code: assetCode, issuer: assetIssuer })
+          );
+          setError(null);
+        })
+        .catch((err: unknown) => {
+          if (cancelled) return;
+          setSnapshot(null);
+          setError(err instanceof Error ? err.message : "Balance lookup failed");
+        })
+        .finally(() => {
+          if (!cancelled) setLoading(false);
+        });
+    });
 
     return () => {
       cancelled = true;
     };
   }, [account, horizonUrl, assetCode, assetIssuer, nonce, refreshKey]);
 
+  // With no wallet connected the hook reports the empty state directly, so the
+  // effect never has to reset state synchronously before fetching.
+  const activeSnapshot = account ? snapshot : null;
+  const activeError = account ? error : null;
+  const activeLoading = account ? loading : false;
+
   const check: BalanceCheck = !account
     ? { sufficient: false, reason: "no-wallet", alert: null }
-    : loading
+    : activeLoading
       ? { sufficient: false, reason: null, alert: null }
       : evaluateBalance(snapshot, amountBaseUnits, {
           tokenSymbol,
@@ -308,12 +317,15 @@ export function useTokenBalance(
         });
 
   return {
-    snapshot,
+    snapshot: activeSnapshot,
     check,
-    loading,
-    error,
-    canSubmit: Boolean(account) && !loading && !error && check.sufficient,
-    alert: error ? `Balance lookup failed: ${error}` : check.alert,
+    loading: activeLoading,
+    error: activeError,
+    canSubmit:
+      Boolean(account) && !activeLoading && !activeError && check.sufficient,
+    alert: activeError
+      ? `Balance lookup failed: ${activeError}`
+      : check.alert,
     refresh,
   };
 }

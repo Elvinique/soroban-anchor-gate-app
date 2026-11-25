@@ -63,7 +63,8 @@ export interface ContractCall {
    * Current sequence number of `sourceAccount`, as a decimal string.
    *
    * Supplying it keeps assembly offline. Read it from Horizon or Soroban RPC
-   * before going air-gapped.
+   * before going air-gapped. The assembled transaction carries
+   * `sequence + 1`, matching `TransactionBuilder`'s account semantics.
    */
   sequence: string;
   /** Soroban contract ID (`C...`) to invoke. */

@@ -480,7 +480,7 @@ export function PaymentQR({ size = 224, className = "", onCopy, ...input }: Paym
             onClick={() => handleCopy("address", model.destination)}
             aria-label="Copy destination address"
           >
-            {copied === "address" ? <Check className="mr-1 h-3 w-3" /> : <Copy className="mr-1 h-3 w-3" />}
+            {copied === "address" ? <Check className="mr-1 h-3 w-3" aria-hidden="true" /> : <Copy className="mr-1 h-3 w-3" aria-hidden="true" />}
             {copied === "address" ? "Address copied" : "Copy address"}
           </Button>
           <Button
@@ -491,7 +491,7 @@ export function PaymentQR({ size = 224, className = "", onCopy, ...input }: Paym
             onClick={() => handleCopy("uri", model.uri)}
             aria-label="Copy SEP-0007 payment URI"
           >
-            {copied === "uri" ? <Check className="mr-1 h-3 w-3" /> : <Copy className="mr-1 h-3 w-3" />}
+            {copied === "uri" ? <Check className="mr-1 h-3 w-3" aria-hidden="true" /> : <Copy className="mr-1 h-3 w-3" aria-hidden="true" />}
             {copied === "uri" ? "URI copied" : "Copy payment URI"}
           </Button>
         </div>

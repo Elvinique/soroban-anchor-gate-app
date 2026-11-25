@@ -340,6 +340,10 @@ export class EscrowSocketClient {
     socket.onerror = () => {
       if (this.socket !== socket) return;
       this.emit("error");
+      if (socket.readyState !== 1) {
+        this.socket = null;
+        this.scheduleReconnect();
+      }
     };
 
     socket.onclose = () => {

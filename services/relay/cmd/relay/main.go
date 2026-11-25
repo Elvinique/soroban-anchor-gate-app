@@ -35,6 +35,19 @@ func main() {
 		return
 	}
 
+	// Support container HEALTHCHECK without curl/wget in distroless runtime images.
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		apiPort := os.Getenv("PORT")
+		if apiPort == "" {
+			apiPort = "8080"
+		}
+		if err := checkHealth(fmt.Sprintf("http://127.0.0.1:%s/health", apiPort)); err != nil {
+			logger.Error("Relay healthcheck failed", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	contractID := os.Getenv("SOROBAN_CONTRACT_ID")
 	if contractID == "" {
 		contractID = "CBIHLECKLMXYK6FPHSGGVYF6AHNFRHR3T5EIFIS3PFQDFKDQWNR25PHT"
@@ -334,4 +347,17 @@ func handleMigrateCommand(logger *slog.Logger, args []string) {
 		logger.Error("Unknown migration command", "command", args[0])
 		os.Exit(1)
 	}
+}
+
+func checkHealth(endpoint string) error {
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(endpoint)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected health status: %d", resp.StatusCode)
+	}
+	return nil
 }

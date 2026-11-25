@@ -5,6 +5,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { createPortal } from "react-dom";
 import { Menu, X, LayoutDashboard, PlusCircle, Scale, type LucideIcon } from "lucide-react";
+import { getFocusableElements, trapDialogFocus } from "@/lib/a11y";
 
 /**
  * Responsive mobile navigation + touch optimisations.
@@ -81,16 +82,6 @@ export function drawerReducer(isOpen: boolean, action: DrawerAction): boolean {
 
 const noopSubscribe = () => () => undefined;
 
-/** Returns the focusable descendants of a container, in DOM order. */
-function getFocusable(container: HTMLElement | null): HTMLElement[] {
-  if (!container) return [];
-  return Array.from(
-    container.querySelectorAll<HTMLElement>(
-      'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
-    )
-  );
-}
-
 export interface MobileNavProps {
   items?: NavItem[];
   /** Brand node rendered at the top of the drawer. */
@@ -147,7 +138,7 @@ export function MobileNav({
     const { body } = document;
     const previousOverflow = body.style.overflow;
     body.style.overflow = "hidden";
-    getFocusable(panelRef.current)[0]?.focus();
+    getFocusableElements(panelRef.current)[0]?.focus();
 
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
@@ -155,18 +146,7 @@ export function MobileNav({
         dispatch("escape");
         return;
       }
-      if (event.key !== "Tab") return;
-      const focusable = getFocusable(panelRef.current);
-      if (focusable.length === 0) return;
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
+      trapDialogFocus(panelRef.current, event);
     };
     document.addEventListener("keydown", onKeyDown);
     return () => {
@@ -342,6 +322,43 @@ export function StickyActionHeader({ className = "", children, ...rest }: React.
     <th scope="col" className={`${STICKY_ACTION_CELL_CLASS} px-2 py-3 text-right ${className}`} {...rest}>
       {children ?? <span className="sr-only">Actions</span>}
     </th>
+  );
+}
+
+export function DesktopNav({
+  items = DEFAULT_NAV_ITEMS,
+  pathname: pathnameOverride,
+  className = "",
+}: {
+  items?: NavItem[];
+  pathname?: string;
+  className?: string;
+}) {
+  const routerPathname = usePathname();
+  const pathname = pathnameOverride ?? routerPathname;
+
+  return (
+    <nav aria-label="Primary" className={`hidden md:flex items-center gap-1 ${className}`}>
+      {items.map((item) => {
+        const active = isNavItemActive(item.href, pathname);
+        const Icon = item.icon;
+        return (
+          <Link
+            key={item.href}
+            href={item.href}
+            aria-current={active ? "page" : undefined}
+            className={`inline-flex items-center gap-2 rounded-xl px-3 py-2 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${
+              active
+                ? "bg-primary/15 text-primary border border-primary/25 font-semibold"
+                : "text-muted-foreground hover:text-foreground hover:bg-muted/60 border border-transparent"
+            }`}
+          >
+            {Icon && <Icon className="h-4 w-4 shrink-0" aria-hidden="true" />}
+            <span>{item.label}</span>
+          </Link>
+        );
+      })}
+    </nav>
   );
 }
 

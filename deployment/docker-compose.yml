@@ -1,31 +1,107 @@
 services:
+  soroban-rpc:
+    image: stellar/quickstart:latest
+    container_name: soroban-anchor-rpc
+    restart: unless-stopped
+    command:
+      - --standalone
+      - --network testnet
+      - --enable-rpc
+      - --http-addr 0.0.0.0:8000
+      - --public-http-addr http://soroban-rpc:8000
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: soroban-anchor-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: soroban_anchor_gate
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d soroban_anchor_gate"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  contract-seeder:
+    image: stellar/quickstart:latest
+    container_name: soroban-anchor-seeder
+    restart: "no"
+    depends_on:
+      soroban-rpc:
+        condition: service_healthy
+    environment:
+      SOROBAN_RPC_URL: http://soroban-rpc:8000
+      NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+    volumes:
+      - ../.env:/app/.env:rw
+      - ./init.sh:/usr/local/bin/init.sh:ro
+    entrypoint: ["/usr/local/bin/init.sh"]
+
   web:
     build:
-      context: .
+      context: ..
       dockerfile: apps/web/Dockerfile
     container_name: soroban-anchor-web
     restart: unless-stopped
+    depends_on:
+      soroban-rpc:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_ESCROW_CONTRACT_ID: ${CONTRACT_ID:-CBIHLECKLMXYK6FPHSGGVYF6AHNFRHR3T5EIFIS3PFQDFKDQWNR25PHT}
+      NEXT_PUBLIC_STELLAR_NETWORK_PASSPHRASE: ${STELLAR_NETWORK_PASSPHRASE:-Test SDF Network ; September 2015}
+      NEXT_PUBLIC_SOROBAN_RPC_URL: http://soroban-rpc:8000
     ports:
       - "3000:3000"
-    environment:
-      - NODE_ENV=production
-      - NEXT_PUBLIC_ESCROW_CONTRACT_ID=${CONTRACT_ID:-CBIHLECKLMXYK6FPHSGGVYF6AHNFRHR3T5EIFIS3PFQDFKDQWNR25PHT}
-      - NEXT_PUBLIC_STELLAR_NETWORK_PASSPHRASE=${STELLAR_NETWORK_PASSPHRASE:-Test SDF Network ; September 2015}
-      - NEXT_PUBLIC_SOROBAN_RPC_URL=${SOROBAN_RPC_URL:-https://soroban-testnet.stellar.org}
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/"]
+      interval: 15s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
 
   relay:
     build:
-      context: .
+      context: ..
       dockerfile: services/relay/Dockerfile
     container_name: soroban-anchor-relay
     restart: unless-stopped
+    depends_on:
+      soroban-rpc:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
     environment:
-      - SOROBAN_RPC_URL=${SOROBAN_RPC_URL:-https://soroban-testnet.stellar.org}
-      - CONTRACT_ID=${CONTRACT_ID:-CBIHLECKLMXYK6FPHSGGVYF6AHNFRHR3T5EIFIS3PFQDFKDQWNR25PHT}
-      - POLL_INTERVAL_SECONDS=5
-      - STORE_PATH=/data/events.json
+      SOROBAN_CONTRACT_ID: ${CONTRACT_ID:-CBIHLECKLMXYK6FPHSGGVYF6AHNFRHR3T5EIFIS3PFQDFKDQWNR25PHT}
+      SOROBAN_RPC_URL: http://soroban-rpc:8000
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/soroban_anchor_gate?sslmode=disable
+      POLL_INTERVAL_SECONDS: 5
+      STORE_PATH: /data/events.json
+      PORT: 8080
+    ports:
+      - "8080:8080"
     volumes:
       - relay_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/metrics"]
+      interval: 15s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
 
 volumes:
+  postgres_data:
   relay_data:

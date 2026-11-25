@@ -3101,6 +3101,87 @@ fn test_terminating_stream_returns_only_unaccrued_capital() {
     );
 }
 
+// -------------------------------------------------------------------------------------------------
+// Partial Dispute Settlement with Mutual Consent Tests (Issue #58)
+// -------------------------------------------------------------------------------------------------
+
+#[test]
+fn test_propose_settlement_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, admin, treasury, payer, beneficiary, _, token_client, _) =
+        setup_test_env(&env, 10_000);
+    client.init(&admin, &treasury, &200);
+
+    let profile_hash = BytesN::from_array(&env, &[15u8; 32]);
+    let escrow_id = client.create_escrow(
+        &payer,
+        &beneficiary,
+        &token_client.address,
+        &10_000,
+        &profile_hash,
+        &500,
+    );
+
+    // Payer proposes 40% (4_000 bps) to payer, leaving 60% (6_000 bps) to beneficiary
+    let res = client.try_propose_settlement(&escrow_id, &4_000);
+    assert!(res.is_ok());
+
+    let proposal = client.get_settlement_proposal(&escrow_id);
+    assert_eq!(proposal.escrow_id, escrow_id);
+    assert_eq!(proposal.proposer, payer);
+    assert_eq!(proposal.payer_bps, 4_000);
+}
+
+#[test]
+fn test_accept_settlement_success_disburses_funds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, contract_id, admin, treasury, payer, beneficiary, _, token_client, _) =
+        setup_test_env(&env, 10_000);
+    client.init(&admin, &treasury, &200);
+
+    let profile_hash = BytesN::from_array(&env, &[16u8; 32]);
+    let escrow_id = client.create_escrow(
+        &payer,
+        &beneficiary,
+        &token_client.address,
+        &10_000,
+        &profile_hash,
+        &500,
+    );
+
+    // Payer proposes 3_500 bps (35% to payer, 65% to beneficiary)
+    assert!(client.try_propose_settlement(&escrow_id, &3_500).is_ok());
+
+    // Beneficiary accepts settlement proposal
+    let res_accept = client.try_accept_settlement(&escrow_id);
+    assert!(res_accept.is_ok());
+
+    // Funds disbursed immediately: payer gets 3,500, beneficiary gets 6,500
+    assert_eq!(token_client.balance(&payer), 3_500);
+    assert_eq!(token_client.balance(&beneficiary), 6_500);
+    assert_eq!(token_client.balance(&contract_id), 0);
+
+    // Escrow marked Disbursed
+    let record = client.get_escrow(&escrow_id);
+    assert_eq!(record.status, EscrowStatus::Disbursed);
+
+    // Settlement proposal removed
+    assert_eq!(
+        client.try_get_settlement_proposal(&escrow_id),
+        Err(Ok(EscrowError::ProposalNotFound))
+    );
+
+    // Attempting to accept again fails with InvalidStatus
+    assert_eq!(
+        client.try_accept_settlement(&escrow_id),
+        Err(Ok(EscrowError::InvalidStatus))
+    );
+}
+
 #[test]
 fn test_oracle_deviation_disputes_escrow_and_admin_can_resolve_once() {
     let env = Env::default();
@@ -3187,6 +3268,242 @@ fn test_split_release_pays_referrer_from_fee_only() {
     assert_eq!(token_client.balance(&treasury), 160);
     assert_eq!(token_client.balance(&referrer), 40);
     assert_eq!(token_client.balance(&recipient), 9_800);
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+#[test]
+fn test_accept_settlement_without_proposal_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, admin, treasury, payer, beneficiary, _, token_client, _) =
+        setup_test_env(&env, 10_000);
+    client.init(&admin, &treasury, &200);
+
+    let profile_hash = BytesN::from_array(&env, &[17u8; 32]);
+    let escrow_id = client.create_escrow(
+        &payer,
+        &beneficiary,
+        &token_client.address,
+        &10_000,
+        &profile_hash,
+        &500,
+    );
+
+    // Accept without a proposal must fail with ProposalNotFound
+    let res = client.try_accept_settlement(&escrow_id);
+    assert_eq!(res, Err(Ok(EscrowError::ProposalNotFound)));
+}
+
+#[test]
+fn test_propose_settlement_invalid_bps_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, admin, treasury, payer, beneficiary, _, token_client, _) =
+        setup_test_env(&env, 10_000);
+    client.init(&admin, &treasury, &200);
+
+    let profile_hash = BytesN::from_array(&env, &[18u8; 32]);
+    let escrow_id = client.create_escrow(
+        &payer,
+        &beneficiary,
+        &token_client.address,
+        &10_000,
+        &profile_hash,
+        &500,
+    );
+
+    // Payer bps > 10_000 rejected
+    let res = client.try_propose_settlement(&escrow_id, &10_001);
+    assert_eq!(res, Err(Ok(EscrowError::InvalidBps)));
+}
+
+#[test]
+fn test_propose_settlement_invalid_status_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, admin, treasury, payer, beneficiary, anchor_addr, token_client, _) =
+        setup_test_env(&env, 10_000);
+    client.init(&admin, &treasury, &200);
+
+    let profile_hash = BytesN::from_array(&env, &[19u8; 32]);
+    let escrow_id = client.create_escrow(
+        &payer,
+        &beneficiary,
+        &token_client.address,
+        &10_000,
+        &profile_hash,
+        &500,
+    );
+
+    // Escrow released to anchor -> becomes Disbursed
+    client.release_to_anchor(&escrow_id, &payer, &anchor_addr);
+
+    // Propose settlement on already disbursed escrow must fail with InvalidStatus
+    let res = client.try_propose_settlement(&escrow_id, &5_000);
+    assert_eq!(res, Err(Ok(EscrowError::InvalidStatus)));
+}
+
+#[test]
+fn test_propose_settlement_by_unauthorized_party_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, admin, treasury, payer, beneficiary, _, token_client, _) =
+        setup_test_env(&env, 10_000);
+    client.init(&admin, &treasury, &200);
+
+    let stranger = Address::generate(&env);
+    let profile_hash = BytesN::from_array(&env, &[21u8; 32]);
+    let escrow_id = client.create_escrow(
+        &payer,
+        &beneficiary,
+        &token_client.address,
+        &10_000,
+        &profile_hash,
+        &500,
+    );
+
+    // Unrelated party cannot propose a settlement
+    let res = client.try_propose_settlement_by(&escrow_id, &stranger, &5_000);
+    assert_eq!(res, Err(Ok(EscrowError::Unauthorized)));
+}
+
+#[test]
+fn test_accept_settlement_by_non_counterparty_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, admin, treasury, payer, beneficiary, _, token_client, _) =
+        setup_test_env(&env, 10_000);
+    client.init(&admin, &treasury, &200);
+
+    let stranger = Address::generate(&env);
+    let profile_hash = BytesN::from_array(&env, &[22u8; 32]);
+    let escrow_id = client.create_escrow(
+        &payer,
+        &beneficiary,
+        &token_client.address,
+        &10_000,
+        &profile_hash,
+        &500,
+    );
+
+    // Payer proposes
+    assert!(client.try_propose_settlement(&escrow_id, &5_000).is_ok());
+
+    // Proposer cannot accept their own proposal
+    let res_self = client.try_accept_settlement_by(&escrow_id, &payer);
+    assert_eq!(res_self, Err(Ok(EscrowError::Unauthorized)));
+
+    // Stranger cannot accept
+    let res_stranger = client.try_accept_settlement_by(&escrow_id, &stranger);
+    assert_eq!(res_stranger, Err(Ok(EscrowError::Unauthorized)));
+}
+
+#[test]
+fn test_edge_case_both_parties_agree_vs_dispute_escalated_to_arbiter() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, admin, treasury, payer, beneficiary, _, token_client, _) =
+        setup_test_env(&env, 10_000);
+    client.init(&admin, &treasury, &200);
+
+    let profile_hash = BytesN::from_array(&env, &[23u8; 32]);
+    let escrow_id = client.create_escrow(
+        &payer,
+        &beneficiary,
+        &token_client.address,
+        &10_000,
+        &profile_hash,
+        &500,
+    );
+
+    // 1. Parties mutually agree to a settlement
+    assert!(client.try_propose_settlement(&escrow_id, &7_000).is_ok());
+    assert!(client.try_accept_settlement(&escrow_id).is_ok());
+
+    // Status is Disbursed; funds are already settled
+    let record = client.get_escrow(&escrow_id);
+    assert_eq!(record.status, EscrowStatus::Disbursed);
+    assert_eq!(token_client.balance(&payer), 7_000);
+    assert_eq!(token_client.balance(&beneficiary), 3_000);
+
+    // 2. An attempt to subsequently escalate to arbiter via resolve_dispute must be rejected
+    let res_arbiter = client.try_resolve_dispute(&escrow_id, &admin, &5_000, &5_000);
+    assert_eq!(res_arbiter, Err(Ok(EscrowError::InvalidStatus)));
+}
+
+#[test]
+fn test_edge_case_arbiter_resolved_first_vs_mutual_settlement() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, admin, treasury, payer, beneficiary, _, token_client, _) =
+        setup_test_env(&env, 10_000);
+    client.init(&admin, &treasury, &200);
+
+    let profile_hash = BytesN::from_array(&env, &[24u8; 32]);
+    let escrow_id = client.create_escrow(
+        &payer,
+        &beneficiary,
+        &token_client.address,
+        &10_000,
+        &profile_hash,
+        &500,
+    );
+
+    // 1. Arbiter resolves dispute first
+    let res_arbiter = client.try_resolve_dispute(&escrow_id, &admin, &6_000, &4_000);
+    assert!(res_arbiter.is_ok());
+
+    let record = client.get_escrow(&escrow_id);
+    assert_eq!(record.status, EscrowStatus::Disputed);
+
+    // 2. Subsequent mutual settlement attempt must be rejected
+    let res_prop = client.try_propose_settlement(&escrow_id, &5_000);
+    assert_eq!(res_prop, Err(Ok(EscrowError::InvalidStatus)));
+
+    let res_accept = client.try_accept_settlement(&escrow_id);
+    assert_eq!(res_accept, Err(Ok(EscrowError::InvalidStatus)));
+}
+
+#[test]
+fn test_beneficiary_initiated_proposal_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, contract_id, admin, treasury, payer, beneficiary, _, token_client, _) =
+        setup_test_env(&env, 10_000);
+    client.init(&admin, &treasury, &200);
+
+    let profile_hash = BytesN::from_array(&env, &[25u8; 32]);
+    let escrow_id = client.create_escrow(
+        &payer,
+        &beneficiary,
+        &token_client.address,
+        &10_000,
+        &profile_hash,
+        &500,
+    );
+
+    // Beneficiary initiates proposal offering 2_000 bps to payer, 8_000 bps to beneficiary
+    let res_prop = client.try_propose_settlement_by(&escrow_id, &beneficiary, &2_000);
+    assert!(res_prop.is_ok());
+
+    let proposal = client.get_settlement_proposal(&escrow_id);
+    assert_eq!(proposal.proposer, beneficiary);
+    assert_eq!(proposal.payer_bps, 2_000);
+
+    // Payer accepts (as counterparty)
+    let res_accept = client.try_accept_settlement_by(&escrow_id, &payer);
+    assert!(res_accept.is_ok());
+
+    assert_eq!(token_client.balance(&payer), 2_000);
+    assert_eq!(token_client.balance(&beneficiary), 8_000);
     assert_eq!(token_client.balance(&contract_id), 0);
 }
 

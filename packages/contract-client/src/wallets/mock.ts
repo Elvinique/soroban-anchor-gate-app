@@ -186,7 +186,7 @@ export class MockWalletAdapter implements WalletAdapter {
     }
 
     envelope.sign(this.keypair);
-    return envelope.toXDR("base64");
+    return envelope.toXDR();
   }
 
   /** Marks the wallet as disconnected. */

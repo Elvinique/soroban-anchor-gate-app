@@ -74,7 +74,7 @@ describe("buildUnsignedXDR", () => {
     assert.equal(decoded.operations.length, 1);
     assert.equal(decoded.operations[0].type, "invokeHostFunction");
     assert.equal(decoded.signatures.length, 0);
-    assert.equal(decoded.toXDR("base64"), unsigned);
+    assert.equal(decoded.toXDR(), unsigned);
   });
 
   test("applies fee, timeout, and memo defaults", () => {

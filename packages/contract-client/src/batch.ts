@@ -273,7 +273,7 @@ export function buildUnsignedXDR(invocation: ContractCall): string {
     invocation.timeoutSeconds ?? DEFAULT_TRANSACTION_TIMEOUT_SECONDS
   );
 
-  return builder.build().toXDR("base64");
+  return builder.build().toXDR();
 }
 
 /**

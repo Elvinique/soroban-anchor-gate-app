@@ -111,7 +111,7 @@ describe("MockWalletAdapter", () => {
     );
     assert.equal(transaction.signatures.length, 1);
 
-    const signature = transaction.signatures[0].signature();
+    const signature = transaction.signatures[0].signature;
     assert.equal(
       keypair.verify(transaction.hash(), signature),
       true,

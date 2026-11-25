@@ -103,6 +103,15 @@ pub struct VolumeTracker {
     pub volume: i128,
 }
 
+/// Settlement proposal for mutual split between payer and beneficiary.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettlementProposal {
+    pub escrow_id: u64,
+    pub proposer: Address,
+    pub payer_bps: u32,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -141,4 +150,6 @@ pub enum DataKey {
     Hashlock(u64),
     // Secondary beneficiary fallback routing (Issue 64)
     SecondaryBeneficiary(u64),
+    // Partial dispute settlements with mutual consent (Issue 58)
+    SettlementProposal(u64),
 }

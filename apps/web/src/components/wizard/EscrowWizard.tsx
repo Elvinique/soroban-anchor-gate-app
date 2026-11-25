@@ -28,12 +28,17 @@ export interface EscrowWizardProps {
   onSubmit: (state: WizardState) => Promise<void>;
   busy: boolean;
   statusMessage: string | null;
+  /** Inline balance alert from `useTokenBalance` (e.g. insufficient funds). */
+  balanceAlert?: string | null;
+  /** Pass `canSubmit` from `useTokenBalance`; false blocks submission. */
+  balanceOk?: boolean;
 }
 
 const labelCls = "text-xs font-semibold text-muted-foreground uppercase tracking-wider";
 
 export function EscrowWizard(props: EscrowWizardProps) {
   const { walletAddress, tokens, fetchBalance, simulate, onSubmit, busy, statusMessage } = props;
+  const { balanceAlert, balanceOk = true } = props;
   const [state, dispatch] = useReducer(wizardReducer, tokens[0]?.address ?? "", initialWizardState);
   const [touched, setTouched] = useState(false);
   const [preview, setPreview] = useState<string | null>(null);
@@ -177,6 +182,7 @@ export function EscrowWizard(props: EscrowWizardProps) {
       )}
 
       {error && <p role="alert" className="text-sm text-red-500">{error}</p>}
+      {balanceAlert && !error && <p role="alert" className="text-sm text-red-500">{balanceAlert}</p>}
       {statusMessage && <p role="status" className="text-xs text-muted-foreground">{statusMessage}</p>}
 
       <div className="flex flex-col-reverse sm:flex-row justify-between gap-3">
@@ -186,7 +192,11 @@ export function EscrowWizard(props: EscrowWizardProps) {
         {state.step < LAST_STEP ? (
           <Button type="button" onClick={next}>Next</Button>
         ) : (
-          <Button type="button" onClick={() => onSubmit(state)} disabled={busy || !walletAddress}>
+          <Button
+            type="button"
+            onClick={() => onSubmit(state)}
+            disabled={busy || !walletAddress || !balanceOk}
+          >
             {walletAddress ? "Sign with Freighter" : "Connect wallet to sign"}
           </Button>
         )}

@@ -7,7 +7,7 @@ use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger as _},
     token::Client as TokenClient,
     token::StellarAssetClient,
-    vec, Address, BytesN, Env, Symbol, TryFromVal, Vec,
+    vec, Address, Bytes, BytesN, Env, Symbol, TryFromVal, Vec,
 };
 
 #[contract]
@@ -2975,6 +2975,8 @@ fn test_time_weighted_cancellation_uses_single_floor_and_routes_funds() {
         cancellation_penalty_bps: 1_100,
         referrer: None,
         committed_rate: None,
+        hashlock: None,
+        secondary_beneficiary: None,
     };
     let escrow_id = client.create_escrow_with_params(&params);
     env.ledger().with_mut(|ledger| ledger.timestamp = 1_010);
@@ -3007,6 +3009,8 @@ fn test_cancellation_rejects_deadline_and_bps_above_full_penalty() {
         cancellation_penalty_bps: 10_001,
         referrer: None,
         committed_rate: None,
+        hashlock: None,
+        secondary_beneficiary: None,
     };
     assert_eq!(
         client.try_create_escrow_with_params(&params),
@@ -3040,6 +3044,8 @@ fn test_referrer_receives_twenty_percent_of_platform_fee() {
         cancellation_penalty_bps: 0,
         referrer: Some(referrer.clone()),
         committed_rate: None,
+        hashlock: None,
+        secondary_beneficiary: None,
     };
     let escrow_id = client.create_escrow_with_params(&params);
 
@@ -3197,6 +3203,8 @@ fn test_oracle_deviation_disputes_escrow_and_admin_can_resolve_once() {
         cancellation_penalty_bps: 0,
         referrer: None,
         committed_rate: Some(100),
+        hashlock: None,
+        secondary_beneficiary: None,
     };
     let within_limit_id = client.create_escrow_with_params(&params);
     client.release_to_anchor(&within_limit_id, &payer, &anchor);
@@ -3242,6 +3250,8 @@ fn test_split_release_pays_referrer_from_fee_only() {
         cancellation_penalty_bps: 0,
         referrer: Some(referrer.clone()),
         committed_rate: None,
+        hashlock: None,
+        secondary_beneficiary: None,
     };
     let escrow_id = client.create_escrow_with_params(&params);
     let commitments = vec![
@@ -3517,6 +3527,8 @@ fn test_oracle_deviation_also_blocks_split_release() {
         cancellation_penalty_bps: 0,
         referrer: None,
         committed_rate: Some(100),
+        hashlock: None,
+        secondary_beneficiary: None,
     };
     let escrow_id = client.create_escrow_with_params(&params);
     let commitments = vec![
@@ -3535,36 +3547,354 @@ fn test_oracle_deviation_also_blocks_split_release() {
     assert_eq!(token_client.balance(&contract_id), 10_000);
 }
 
+// =============================================================================
+// Wave Tasks: Issues #67, #65, #64
+// =============================================================================
+
+#[contract]
+struct MockMaliciousToken;
+
+#[contractimpl]
+impl MockMaliciousToken {
+    pub fn setup_attack(
+        env: Env,
+        target_escrow_contract: Address,
+        target_escrow_id: u64,
+        attacker: Address,
+    ) {
+        env.storage()
+            .instance()
+            .set(&symbol_short!("target"), &target_escrow_contract);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("escrow"), &target_escrow_id);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("atk"), &attacker);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("active"), &true);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("caught"), &false);
+    }
+
+    pub fn transfer(env: Env, _from: Address, _to: Address, _amount: i128) {
+        let is_active: bool = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("active"))
+            .unwrap_or(false);
+        if is_active {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("active"), &false);
+            let target: Address = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("target"))
+                .unwrap();
+            let escrow_id: u64 = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("escrow"))
+                .unwrap();
+            let attacker: Address = env.storage().instance().get(&symbol_short!("atk")).unwrap();
+            let client = EscrowGateClient::new(&env, &target);
+            // Reentrant call back into EscrowGate during transfer execution
+            let res = client.try_release_to_anchor(&escrow_id, &attacker, &attacker);
+            if res.is_err() {
+                env.storage()
+                    .instance()
+                    .set(&symbol_short!("caught"), &true);
+            }
+        }
+    }
+
+    pub fn balance(_env: Env, _id: Address) -> i128 {
+        100_000
+    }
+
+    pub fn was_caught(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&symbol_short!("caught"))
+            .unwrap_or(false)
+    }
+}
+
 #[test]
-fn test_settlement_proposal_overwritten_before_acceptance() {
+fn test_reentrancy_guard_direct() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowGate, ());
+    env.as_contract(&contract_id, || {
+        let guard1 = ReentrancyGuard::enter(&env);
+        assert!(guard1.is_ok());
+        let guard2 = ReentrancyGuard::enter(&env);
+        assert_eq!(guard2.err(), Some(EscrowError::ReentrancyDetected));
+        drop(guard1);
+        let guard3 = ReentrancyGuard::enter(&env);
+        assert!(guard3.is_ok());
+    });
+}
+
+#[test]
+fn test_reentrancy_lock_blocks_recursive_call() {
     let env = Env::default();
     env.mock_all_auths();
+    let (client, contract_id, admin, treasury, payer, beneficiary, _, _, _) =
+        setup_test_env(&env, 0);
+    client.init(&admin, &treasury, &0);
 
-    let (client, _, admin, treasury, payer, beneficiary, _, token_client, _) =
-        setup_test_env(&env, 10_000);
-    client.init(&admin, &treasury, &200);
+    let mal_token_id = env.register(MockMaliciousToken, ());
+    let mal_token_client = MockMaliciousTokenClient::new(&env, &mal_token_id);
+    client.set_token_whitelist(&admin, &mal_token_id, &true);
 
-    let profile_hash = BytesN::from_array(&env, &[26u8; 32]);
+    let escrow_id = client.create_escrow(
+        &payer,
+        &beneficiary,
+        &mal_token_id,
+        &5_000,
+        &BytesN::from_array(&env, &[40; 32]),
+        &100,
+    );
+
+    mal_token_client.setup_attack(&contract_id, &escrow_id, &payer);
+
+    // Call release_to_anchor which invokes transfer() on mal_token, triggering recursive reentrancy
+    client.release_to_anchor(&escrow_id, &payer, &beneficiary);
+
+    assert!(mal_token_client.was_caught());
+    assert_eq!(
+        client.get_escrow(&escrow_id).status,
+        EscrowStatus::Disbursed
+    );
+}
+
+#[test]
+fn test_gas_benchmark_transient_reentrancy_lock_overhead() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, admin, treasury, payer, beneficiary, anchor, token_client, _) =
+        setup_test_env(&env, 50_000);
+    client.init(&admin, &treasury, &100);
+
+    let mut samples: std::vec::Vec<GasSample> = std::vec::Vec::new();
+
     let escrow_id = client.create_escrow(
         &payer,
         &beneficiary,
         &token_client.address,
         &10_000,
-        &profile_hash,
-        &500,
+        &BytesN::from_array(&env, &[41; 32]),
+        &100,
+    );
+    samples.push(record_gas(
+        &env,
+        "create_escrow (transient lock)",
+        "10k tokens",
+    ));
+
+    client.release_to_anchor(&escrow_id, &payer, &anchor);
+    samples.push(record_gas(
+        &env,
+        "release_to_anchor (transient lock)",
+        "full release",
+    ));
+
+    print_gas_table("Transient storage reentrancy lock overhead", &samples);
+
+    for s in &samples {
+        assert!(s.cpu < MAINNET_TX_MAX_CPU_INSTRUCTIONS / 20);
+    }
+}
+
+#[test]
+fn test_htlc_release_with_valid_preimage() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, contract_id, admin, treasury, payer, beneficiary, _, token_client, _) =
+        setup_test_env(&env, 20_000);
+    client.init(&admin, &treasury, &200);
+
+    let preimage = Bytes::from_slice(&env, b"open-sesame-soroban-htlc-secret");
+    let hashlock: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+    let params = EscrowInitParams {
+        payer: payer.clone(),
+        beneficiary: beneficiary.clone(),
+        token: token_client.address.clone(),
+        amount: 10_000,
+        profile_hash: BytesN::from_array(&env, &[42; 32]),
+        lock_duration: 100,
+        cancellation_penalty_bps: 0,
+        referrer: None,
+        committed_rate: None,
+        hashlock: Some(hashlock.clone()),
+        secondary_beneficiary: None,
+    };
+    let escrow_id = client.create_escrow_with_params(&params);
+    assert_eq!(client.get_hashlock(&escrow_id), hashlock);
+
+    let res = client.try_release_with_preimage(&escrow_id, &preimage);
+    assert!(res.is_ok());
+
+    assert_eq!(
+        client.get_escrow(&escrow_id).status,
+        EscrowStatus::Disbursed
+    );
+    assert_eq!(token_client.balance(&treasury), 200);
+    assert_eq!(token_client.balance(&beneficiary), 9_800);
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+#[test]
+fn test_htlc_release_with_invalid_preimage_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, admin, treasury, payer, beneficiary, _, token_client, _) =
+        setup_test_env(&env, 20_000);
+    client.init(&admin, &treasury, &0);
+
+    let preimage = Bytes::from_slice(&env, b"correct-secret");
+    let hashlock: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+    let params = EscrowInitParams {
+        payer: payer.clone(),
+        beneficiary,
+        token: token_client.address.clone(),
+        amount: 10_000,
+        profile_hash: BytesN::from_array(&env, &[43; 32]),
+        lock_duration: 100,
+        cancellation_penalty_bps: 0,
+        referrer: None,
+        committed_rate: None,
+        hashlock: Some(hashlock),
+        secondary_beneficiary: None,
+    };
+    let escrow_id = client.create_escrow_with_params(&params);
+
+    let wrong_preimage = Bytes::from_slice(&env, b"wrong-guess");
+    let res = client.try_release_with_preimage(&escrow_id, &wrong_preimage);
+    assert_eq!(res, Err(Ok(EscrowError::InvalidPreimage)));
+}
+
+#[test]
+fn test_htlc_timeout_refund_functions() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, contract_id, admin, treasury, payer, beneficiary, _, token_client, _) =
+        setup_test_env(&env, 20_000);
+    client.init(&admin, &treasury, &0);
+
+    let preimage = Bytes::from_slice(&env, b"unrevealed-secret");
+    let hashlock: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+    let params = EscrowInitParams {
+        payer: payer.clone(),
+        beneficiary,
+        token: token_client.address.clone(),
+        amount: 10_000,
+        profile_hash: BytesN::from_array(&env, &[44; 32]),
+        lock_duration: 100,
+        cancellation_penalty_bps: 0,
+        referrer: None,
+        committed_rate: None,
+        hashlock: Some(hashlock),
+        secondary_beneficiary: None,
+    };
+    let escrow_id = client.create_escrow_with_params(&params);
+
+    env.ledger().with_mut(|l| l.timestamp += 150);
+
+    assert_eq!(
+        client.try_release_with_preimage(&escrow_id, &preimage),
+        Err(Ok(EscrowError::UnlockTimePassed))
     );
 
-    // Payer first proposes 5_000 bps
-    assert!(client.try_propose_settlement(&escrow_id, &5_000).is_ok());
-    assert_eq!(client.get_settlement_proposal(&escrow_id).payer_bps, 5_000);
+    let refund_res = client.try_refund(&escrow_id);
+    assert!(refund_res.is_ok());
+    assert_eq!(client.get_escrow(&escrow_id).status, EscrowStatus::Refunded);
+    assert_eq!(token_client.balance(&payer), 20_000);
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
 
-    // Payer updates proposal to 8_000 bps
-    assert!(client.try_propose_settlement(&escrow_id, &8_000).is_ok());
-    assert_eq!(client.get_settlement_proposal(&escrow_id).payer_bps, 8_000);
+#[test]
+fn test_secondary_beneficiary_fallback_payout() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, contract_id, admin, treasury, payer, primary_beneficiary, _, token_client, _) =
+        setup_test_env(&env, 20_000);
+    let secondary = Address::generate(&env);
+    client.init(&admin, &treasury, &100);
 
-    // Beneficiary accepts updated proposal
-    assert!(client.try_accept_settlement(&escrow_id).is_ok());
+    let params = EscrowInitParams {
+        payer: payer.clone(),
+        beneficiary: primary_beneficiary.clone(),
+        token: token_client.address.clone(),
+        amount: 10_000,
+        profile_hash: BytesN::from_array(&env, &[45; 32]),
+        lock_duration: 100,
+        cancellation_penalty_bps: 0,
+        referrer: None,
+        committed_rate: None,
+        hashlock: None,
+        secondary_beneficiary: Some(secondary.clone()),
+    };
+    let escrow_id = client.create_escrow_with_params(&params);
+    assert_eq!(client.get_secondary_beneficiary(&escrow_id), secondary);
 
-    assert_eq!(token_client.balance(&payer), 8_000);
-    assert_eq!(token_client.balance(&beneficiary), 2_000);
+    let res = client.try_redirect_disbursement(&escrow_id, &payer);
+    assert!(res.is_ok());
+
+    assert_eq!(
+        client.get_escrow(&escrow_id).status,
+        EscrowStatus::Disbursed
+    );
+    assert_eq!(token_client.balance(&secondary), 9_900);
+    assert_eq!(token_client.balance(&primary_beneficiary), 0);
+    assert_eq!(token_client.balance(&treasury), 100);
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+#[test]
+fn test_secondary_beneficiary_authentication_boundaries() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, admin, treasury, payer, beneficiary, _, token_client, _) =
+        setup_test_env(&env, 20_000);
+    let rogue = Address::generate(&env);
+    let secondary = Address::generate(&env);
+    client.init(&admin, &treasury, &0);
+
+    let escrow_id = client.create_escrow(
+        &payer,
+        &beneficiary,
+        &token_client.address,
+        &5_000,
+        &BytesN::from_array(&env, &[46; 32]),
+        &100,
+    );
+
+    assert_eq!(
+        client.try_set_secondary_beneficiary(&escrow_id, &rogue, &secondary),
+        Err(Ok(EscrowError::Unauthorized))
+    );
+
+    assert!(client
+        .try_set_secondary_beneficiary(&escrow_id, &payer, &secondary)
+        .is_ok());
+    assert_eq!(client.get_secondary_beneficiary(&escrow_id), secondary);
+
+    assert_eq!(
+        client.try_redirect_disbursement(&escrow_id, &rogue),
+        Err(Ok(EscrowError::Unauthorized))
+    );
+
+    assert!(client.try_redirect_disbursement(&escrow_id, &admin).is_ok());
+    assert_eq!(
+        client.get_escrow(&escrow_id).status,
+        EscrowStatus::Disbursed
+    );
+    assert_eq!(token_client.balance(&secondary), 5_000);
 }

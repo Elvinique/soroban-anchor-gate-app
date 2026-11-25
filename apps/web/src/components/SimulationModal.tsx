@@ -4,6 +4,7 @@ import * as React from "react";
 import { SorobanDataBuilder, Transaction, rpc } from "@stellar/stellar-sdk";
 import { AlertTriangle, Cpu, Database, Coins, ShieldCheck, X, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { trapDialogFocus } from "@/lib/a11y";
 
 /**
  * Pre-flight simulation modal.
@@ -299,11 +300,20 @@ const ROW_ICONS = [Cpu, Database, Coins];
 export function SimulationModal({ open, state, actionLabel, onConfirm, onCancel, readyExtra }: SimulationModalProps) {
   const titleId = React.useId();
   const descId = React.useId();
+  const dialogRef = React.useRef<HTMLDivElement>(null);
+  const previousFocusRef = React.useRef<HTMLElement | null>(null);
   const primaryRef = React.useRef<HTMLButtonElement>(null);
   const cancelRef = React.useRef<HTMLButtonElement>(null);
 
   React.useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      previousFocusRef.current?.focus();
+      previousFocusRef.current = null;
+      return;
+    }
+    if (!previousFocusRef.current && document.activeElement instanceof HTMLElement) {
+      previousFocusRef.current = document.activeElement;
+    }
     const target = state.phase === "ready" ? primaryRef.current : cancelRef.current;
     target?.focus();
   }, [open, state.phase]);
@@ -311,7 +321,12 @@ export function SimulationModal({ open, state, actionLabel, onConfirm, onCancel,
   React.useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onCancel();
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onCancel();
+        return;
+      }
+      trapDialogFocus(dialogRef.current, e);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -323,6 +338,7 @@ export function SimulationModal({ open, state, actionLabel, onConfirm, onCancel,
     <div className="fixed inset-0 z-[60] flex items-end justify-center sm:items-center" data-testid="simulation-modal">
       <div className="absolute inset-0 bg-background/80 backdrop-blur-sm" aria-hidden="true" onClick={onCancel} />
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
@@ -342,9 +358,9 @@ export function SimulationModal({ open, state, actionLabel, onConfirm, onCancel,
             type="button"
             onClick={onCancel}
             aria-label="Close"
-            className="inline-flex h-12 w-12 shrink-0 items-center justify-center rounded-xl text-muted-foreground hover:bg-muted hover:text-foreground"
+            className="inline-flex h-12 w-12 shrink-0 items-center justify-center rounded-xl text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
           >
-            <X className="h-5 w-5" />
+            <X className="h-5 w-5" aria-hidden="true" />
           </button>
         </div>
 

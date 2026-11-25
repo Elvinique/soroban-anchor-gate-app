@@ -9,6 +9,7 @@ import {
   requestAccess,
 } from "@stellar/freighter-api";
 import { Button } from "@/components/ui/button";
+import { trapDialogFocus } from "@/lib/a11y";
 
 export const WALLET_SESSION_STORAGE_KEY =
   "soroban-anchor-gate.wallet-session.v1";
@@ -236,6 +237,28 @@ export function NetworkMismatchModal({
   const detectedNetwork = detectedNetworkPassphrase
     ? describeNetwork(detectedNetworkPassphrase)
     : "an unknown network";
+  const dialogRef = React.useRef<HTMLDivElement>(null);
+  const dismissRef = React.useRef<HTMLButtonElement>(null);
+
+  React.useEffect(() => {
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    dismissRef.current?.focus();
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onDismiss();
+        return;
+      }
+      trapDialogFocus(dialogRef.current, event);
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      previous?.focus();
+    };
+  }, [onDismiss]);
 
   return (
     <div
@@ -243,6 +266,7 @@ export function NetworkMismatchModal({
       data-testid="network-mismatch-modal"
     >
       <div
+        ref={dialogRef}
         role="alertdialog"
         aria-modal="true"
         aria-labelledby="network-mismatch-title"
@@ -276,7 +300,7 @@ export function NetworkMismatchModal({
         </p>
 
         <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
-          <Button type="button" variant="outline" onClick={onDismiss}>
+          <Button ref={dismissRef} type="button" variant="outline" onClick={onDismiss}>
             Dismiss
           </Button>
           <Button type="button" onClick={onRetry} disabled={isRetrying}>
